@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-30",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+  // SARVAM_API_KEY is provided via .dev.vars (local) or `wrangler secret put SARVAM_API_KEY` (prod).
+}
