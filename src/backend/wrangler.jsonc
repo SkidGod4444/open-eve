@@ -20,6 +20,6 @@
   ]
   // Secrets (set via `wrangler secret put <NAME>` in prod, or .dev.vars locally):
   //   SARVAM_API_KEY     - Sarvam Saaras v3 STT and Bulbul v3 TTS
-  //   OPENAI_API_KEY     - OpenAI for the Vercel AI SDK agent
+  //   OPENHORIZON_API_KEY     - OpenAI for the Vercel AI SDK agent
   //   FIRECRAWL_API_KEY  - Firecrawl web search tool
 }

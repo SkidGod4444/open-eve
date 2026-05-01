@@ -61,7 +61,7 @@ static const char* CHAT_PATH = "/chat";
 
 // Exact name advertised by your Bluetooth speaker (case sensitive). The
 // ESP32-A2DP library will scan for it and auto-connect. Change to match.
-static const char* BT_SPEAKER_NAME = "JBL Flip 5";
+static const char* BT_SPEAKER_NAME = "Stone 350 Pro";
 
 // ---------------------------------------------------------------------------
 // Audio + VAD configuration  (TUNE THESE)

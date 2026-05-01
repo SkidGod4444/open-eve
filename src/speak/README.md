@@ -104,7 +104,7 @@ Open [`speech-to-text.ino`](./speech-to-text.ino) and edit the top constants:
 | `MIC_SHIFT`         | 11 (default). Lower = louder. See header comments.           |
 
 The backend (`src/backend/`) must be deployed and reachable, and its three
-secrets (`SARVAM_API_KEY`, `OPENAI_API_KEY`, `FIRECRAWL_API_KEY`) must be
+secrets (`SARVAM_API_KEY`, `OPENHORIZON_API_KEY`, `FIRECRAWL_API_KEY`) must be
 set. See [`../backend/README.md`](../backend/README.md).
 
 ## Build & flash
@@ -129,7 +129,7 @@ them after the first flash; tune buffers if anything trips.
    utterance pool: 2 x 65536 bytes (2 s each). free=…
    WiFi connected, IP: 192.168.…
    Mic ready
-   A2DP source started, scanning for 'JBL Flip 5'...
+   A2DP source started, scanning for 'Stone 350 Pro'...
    Voice agent ready. frame=20ms preroll=300ms hangover=700ms ...
    ```
 

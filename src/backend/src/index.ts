@@ -47,7 +47,7 @@ const SARVAM_TTS_CHAR_LIMIT = 1800 // bulbul:v3 caps at 2500; keep headroom for 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
 const MAX_HISTORY_MESSAGES = 12 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
-const OPENAI_MODEL = 'gpt-4.1-mini'
+const OPENHORIZON_MODEL = 'openhorizon/gemma4:latest'
 
 const VALID_MODES = ['transcribe', 'translate', 'verbatim', 'translit', 'codemix'] as const
 type Mode = (typeof VALID_MODES)[number]
@@ -72,7 +72,7 @@ app.get('/', (c) =>
     upstreams: {
       stt: 'sarvam.ai/speech-to-text (Saaras v3)',
       tts: 'sarvam.ai/text-to-speech (Bulbul v3)',
-      llm: `openai/${OPENAI_MODEL} via Vercel AI SDK`,
+      llm: `${OPENHORIZON_MODEL} via Vercel AI SDK`,
       websearch: 'firecrawl.dev /search',
     },
     endpoints: {
@@ -224,8 +224,8 @@ app.post('/chat', async (c) => {
   if (!c.env.SARVAM_API_KEY) {
     throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured' })
   }
-  if (!c.env.OPENAI_API_KEY) {
-    throw new HTTPException(500, { message: 'OPENAI_API_KEY is not configured' })
+  if (!c.env.OPENHORIZON_API_KEY) {
+    throw new HTTPException(500, { message: 'OPENHORIZON_API_KEY is not configured' })
   }
   if (!c.env.FIRECRAWL_API_KEY) {
     throw new HTTPException(500, { message: 'FIRECRAWL_API_KEY is not configured' })
@@ -250,7 +250,7 @@ app.post('/chat', async (c) => {
     ? []
     : ((await c.env.SESSIONS.get<ChatTurn[]>(histKey, 'json')) ?? [])
 
-  const openai = createOpenAI({ apiKey: c.env.OPENAI_API_KEY })
+  const openai = createOpenAI({ baseURL: "https://api.openhorizon.devwtf.in/v1", apiKey: c.env.OPENHORIZON_API_KEY })
   const firecrawl = new Firecrawl({ apiKey: c.env.FIRECRAWL_API_KEY })
 
   const webSearch = tool({
@@ -299,7 +299,7 @@ app.post('/chat', async (c) => {
   let reply: string
   try {
     const result = await generateText({
-      model: openai(OPENAI_MODEL),
+      model: openai(OPENHORIZON_MODEL),
       system: systemPrompt,
       messages: [...history, { role: 'user', content: text }],
       tools: { webSearch },
