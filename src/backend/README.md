@@ -1,26 +1,44 @@
 # Open EvE backend
 
-Cloudflare Worker (Hono) that acts as a thin authenticated proxy in front of
-[Sarvam Saaras v3 speech-to-text](https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/speech-to-text/rest-api).
+Cloudflare Worker (Hono) that powers the Open EvE desk robot. It exposes:
 
-The desk robot (ESP32 + I2S microphone) records short utterances and POSTs
-them here; the Worker holds the Sarvam API key and returns the transcript.
+- `POST /transcribe` – proxy to [Sarvam Saaras v3 STT](https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/speech-to-text/rest-api).
+- `POST /chat` – Vercel AI SDK agent (OpenAI `gpt-4.1-mini` + a Firecrawl
+  `webSearch` tool) that takes the user's transcript, keeps the last 6 turns
+  per device in Cloudflare KV, then synthesises the spoken reply with
+  [Sarvam Bulbul v3 TTS](https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/text-to-speech/rest-api)
+  and streams the resulting WAV back to the robot.
+
+The robot ESP32 plays that WAV through a Bluetooth speaker via A2DP source
+(see [`src/speak/`](../speak/)).
 
 ## Run locally
 
 ```sh
 bun install
-bun run dev      # http://localhost:8788
+bun run dev      # http://localhost:8787
 ```
 
-`SARVAM_API_KEY` is loaded from `.dev.vars` for local dev. For production:
+Secrets are read from `.dev.vars` for local dev. For production each one is
+stored as a Worker secret:
 
 ```sh
 bunx wrangler secret put SARVAM_API_KEY
+bunx wrangler secret put OPENAI_API_KEY
+bunx wrangler secret put FIRECRAWL_API_KEY
 bun run deploy
 ```
 
-After changing `wrangler.jsonc`, regenerate types:
+The KV namespace `SESSIONS` (used by `/chat` for conversation history) is
+created once with:
+
+```sh
+bunx wrangler kv namespace create SESSIONS
+bunx wrangler kv namespace create SESSIONS --preview
+# Paste the returned ids into wrangler.jsonc (already done in this repo).
+```
+
+After changing `wrangler.jsonc` or `.dev.vars`, regenerate types:
 
 ```sh
 bun run cf-typegen
@@ -75,18 +93,79 @@ The Worker auto-detects the body shape from `Content-Type`:
 
 ```sh
 # multipart upload
-curl -X POST 'http://localhost:8788/transcribe?language_code=en-IN' \
+curl -X POST 'http://localhost:8787/transcribe?language_code=en-IN' \
   -F 'file=@recording.wav;type=audio/wav'
 
 # raw WAV body
-curl -X POST 'http://localhost:8788/transcribe?language_code=hi-IN&mode=translate' \
+curl -X POST 'http://localhost:8787/transcribe?language_code=hi-IN&mode=translate' \
   -H 'Content-Type: audio/wav' \
   --data-binary @recording.wav
 
 # raw PCM (16 kHz, 16-bit, mono) — what the ESP32 sends
-curl -X POST 'http://localhost:8788/transcribe?sample_rate=16000&channels=1&bits_per_sample=16' \
+curl -X POST 'http://localhost:8787/transcribe?sample_rate=16000&channels=1&bits_per_sample=16' \
   -H 'Content-Type: audio/pcm' \
   --data-binary @recording.pcm
+```
+
+### `POST /chat`
+
+Runs the AI agent and returns Sarvam TTS audio (WAV, 24 kHz mono, Linear16)
+ready for the ESP32 to upsample and stream over A2DP.
+
+#### Request body (JSON)
+
+| Field           | Required | Default   | Notes                                                                 |
+| --------------- | -------- | --------- | --------------------------------------------------------------------- |
+| `deviceId`      | yes      | –         | Stable id per robot (use the MAC). Used as the KV history key.        |
+| `text`          | yes      | –         | Merged user transcript for this turn (1–2000 chars).                  |
+| `language_code` | no       | `en-IN`   | Sarvam BCP-47 hint. Steers the TTS voice; the LLM mirrors the user.   |
+| `speaker`       | no       | `shubh`   | Any Bulbul v3 speaker (e.g. `shubh`, `priya`, `roopa`).               |
+| `reset`         | no       | `false`   | Clear the device's KV history before this turn.                       |
+
+#### Response
+
+`200 audio/wav` body. The text the model said is mirrored back in the
+`X-Reply-Text` response header (URL-encoded, max 256 chars). The
+`X-History-Len` header returns the new message count after this turn.
+
+The Worker:
+
+1. Loads the last ≤12 messages (6 turns) from KV (`hist:<deviceId>`).
+2. Calls `generateText` with the `webSearch` tool. The tool is invoked only
+   when the LLM decides; the loop is hard-capped at 3 steps (`stopWhen:
+   stepCountIs(3)`).
+3. Trims the reply to 1800 characters (Bulbul v3 hard limit is 2500).
+4. Writes the updated history back to KV (TTL 30 minutes).
+5. POSTs the reply to Sarvam Bulbul v3 (`speech_sample_rate: 24000`),
+   base64-decodes the returned WAV, and streams it as the response body.
+
+#### Curl examples
+
+```sh
+# Simple turn (no history yet)
+curl -sS -X POST 'http://localhost:8787/chat' \
+  -H 'content-type: application/json' \
+  -d '{"deviceId":"esp32-test","text":"Tell me a one-line joke about robots."}' \
+  -o reply.wav -D headers.txt
+afplay reply.wav   # macOS
+
+# Web-search turn — the agent invokes the Firecrawl tool internally
+curl -sS -X POST 'http://localhost:8787/chat' \
+  -H 'content-type: application/json' \
+  -d '{"deviceId":"esp32-test","text":"What is the bitcoin price right now?"}' \
+  -o reply.wav
+
+# Memory turn — references the previous question
+curl -sS -X POST 'http://localhost:8787/chat' \
+  -H 'content-type: application/json' \
+  -d '{"deviceId":"esp32-test","text":"And in INR?"}' \
+  -o reply.wav
+
+# Wipe history before a new conversation
+curl -sS -X POST 'http://localhost:8787/chat' \
+  -H 'content-type: application/json' \
+  -d '{"deviceId":"esp32-test","text":"Hi","reset":true}' \
+  -o reply.wav
 ```
 
 ## ESP32 client (Arduino sketch)
@@ -135,9 +214,25 @@ Tips for the firmware:
 
 ```
 src/backend/
-├── src/index.ts            # Hono app + Sarvam proxy
-├── wrangler.jsonc          # Worker config (observability on)
+├── src/index.ts            # Hono app: /transcribe + /chat agent + /health
+├── wrangler.jsonc          # Worker config: KV binding, nodejs_compat, observability
 ├── worker-configuration.d.ts  # generated by `bun run cf-typegen`
-├── .dev.vars               # local SARVAM_API_KEY (gitignored)
-└── package.json
+├── .dev.vars               # local SARVAM_API_KEY / OPENAI_API_KEY / FIRECRAWL_API_KEY (gitignored)
+└── package.json            # ai, @ai-sdk/openai, @mendable/firecrawl-js, hono, zod
+```
+
+## Pipeline (full request)
+
+```
+ESP32 mic --(VAD)--> POST /transcribe (audio/pcm) --> Sarvam STT --> transcript
+                                                          |
+                            client-side merge (1.5 s)     |
+                                                          v
+ESP32 (BT speaker) <-- audio/wav <-- POST /chat (deviceId, text)
+                                          |
+                                          +-- KV: load last 6 turns
+                                          +-- AI SDK generateText (gpt-4.1-mini)
+                                          |     +-- tool: webSearch -> Firecrawl /search
+                                          +-- KV: save updated history (TTL 30 min)
+                                          +-- Sarvam Bulbul v3 TTS (24 kHz mono WAV)
 ```

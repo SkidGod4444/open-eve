@@ -38,6 +38,8 @@
   "C_Cpp_Runner.compilerArgs": [],
   "C_Cpp_Runner.linkerArgs": [],
   "C_Cpp_Runner.includePaths": [
+    "/Users/saidevdhal/Desktop/Codes/open-eve/lib/ESP32-A2DP/src",
+    "/Users/saidevdhal/Desktop/Codes/open-eve/.pio/libdeps/esp32-voice/ESP32-A2DP/src",
     "/Users/saidevdhal/Desktop/Codes/open-eve/include",
     "/Users/saidevdhal/Desktop/Codes/open-eve/src",
     "/Users/saidevdhal/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",

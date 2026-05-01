@@ -4,6 +4,8 @@
       "name": "macos-gcc-x86",
       "includePath": [
         "${workspaceFolder}/**",
+        "${workspaceFolder}/lib/ESP32-A2DP/src",
+        "${workspaceFolder}/.pio/libdeps/esp32-voice/ESP32-A2DP/src",
         "/Users/saidevdhal/Desktop/Codes/open-eve/include",
         "/Users/saidevdhal/Desktop/Codes/open-eve/src",
         "/Users/saidevdhal/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
@@ -246,6 +248,18 @@
       "intelliSenseMode": "macos-gcc-x86",
       "compilerArgs": [
         ""
+      ],
+      "defines": [
+        "ARDUINO=10812",
+        "ARDUINO_ARCH_ESP32",
+        "ESP32",
+        "ESP_PLATFORM",
+        "CONFIG_IDF_TARGET_ESP32=1",
+        "CONFIG_BT_ENABLED=1",
+        "CONFIG_BT_CLASSIC_ENABLED=1",
+        "CONFIG_BLUEDROID_ENABLED=1",
+        "CONFIG_A2DP_ENABLE=1",
+        "CONFIG_FREERTOS_HZ=100"
       ]
     }
   ],

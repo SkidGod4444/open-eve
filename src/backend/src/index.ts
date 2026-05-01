@@ -3,14 +3,20 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { HTTPException } from 'hono/http-exception'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { generateText, stepCountIs, tool } from 'ai'
+import { createOpenAI } from '@ai-sdk/openai'
+import Firecrawl from '@mendable/firecrawl-js'
+import { z } from 'zod'
 
 /**
- * Open EvE backend - speech-to-text proxy.
+ * Open EvE backend - voice agent for the desk robot.
  *
- * The desk robot (ESP32 + I2S mic) records short utterances and POSTs the
- * audio to this Worker. The Worker forwards the audio to Sarvam Saaras v3
- * (https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/speech-to-text/rest-api)
- * and returns the resulting transcript.
+ * Endpoints:
+ *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
+ *   POST /chat        Text -> agent (Vercel AI SDK + OpenAI + Firecrawl
+ *                     web search tool) -> Sarvam Bulbul v3 TTS -> WAV.
+ *                     Conversation history (last 6 turns) is kept in
+ *                     Cloudflare KV per `deviceId`.
  *
  * Supported request bodies on POST /transcribe:
  *   1. multipart/form-data with a `file` field (any Sarvam-supported format).
@@ -24,15 +30,24 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status'
  *      The Worker wraps the PCM in a WAV header before forwarding. This is
  *      the easiest path for an ESP32 streaming I2S samples directly.
  *
- * Optional query params:
+ * Optional /transcribe query params:
  *   mode          transcribe (default) | translate | verbatim | translit | codemix
  *   language_code BCP-47 hint, e.g. hi-IN, en-IN. Required only when Sarvam
  *                 cannot auto-detect (mostly relevant for `transcribe` mode).
  */
 
 const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text'
-const SARVAM_MODEL = 'saaras:v3'
+const SARVAM_TTS_URL = 'https://api.sarvam.ai/text-to-speech'
+const SARVAM_STT_MODEL = 'saaras:v3'
+const SARVAM_TTS_MODEL = 'bulbul:v3'
+const SARVAM_TTS_DEFAULT_SPEAKER = 'shubh'
+const SARVAM_TTS_DEFAULT_LANG = 'en-IN'
+const SARVAM_TTS_SAMPLE_RATE = 24000
+const SARVAM_TTS_CHAR_LIMIT = 1800 // bulbul:v3 caps at 2500; keep headroom for safety
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
+const MAX_HISTORY_MESSAGES = 12 // 6 user + 6 assistant turns
+const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
+const OPENAI_MODEL = 'gpt-4.1-mini'
 
 const VALID_MODES = ['transcribe', 'translate', 'verbatim', 'translit', 'codemix'] as const
 type Mode = (typeof VALID_MODES)[number]
@@ -53,12 +68,18 @@ app.use(
 app.get('/', (c) =>
   c.json({
     name: 'open-eve-backend',
-    description: 'Speech-to-text proxy for the Open EvE desk robot (ESP32 + mic)',
-    upstream: 'sarvam.ai/speech-to-text (Saaras v3)',
+    description: 'Voice agent for the Open EvE desk robot (ESP32 + mic + BT speaker)',
+    upstreams: {
+      stt: 'sarvam.ai/speech-to-text (Saaras v3)',
+      tts: 'sarvam.ai/text-to-speech (Bulbul v3)',
+      llm: `openai/${OPENAI_MODEL} via Vercel AI SDK`,
+      websearch: 'firecrawl.dev /search',
+    },
     endpoints: {
       'GET /': 'this index',
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
+      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> audio/wav',
     },
   })
 )
@@ -145,7 +166,7 @@ app.post('/transcribe', async (c) => {
   }
 
   const sarvamForm = new FormData()
-  sarvamForm.append('model', SARVAM_MODEL)
+  sarvamForm.append('model', SARVAM_STT_MODEL)
   sarvamForm.append('mode', mode)
   if (languageCode) sarvamForm.append('language_code', languageCode)
   sarvamForm.append('file', audioBlob, filename)
@@ -180,6 +201,177 @@ app.post('/transcribe', async (c) => {
   }
 
   return c.json(parsedBody ?? { raw: rawBody })
+})
+
+// ---------------------------------------------------------------------------
+// /chat : transcript -> agent (Vercel AI SDK + Firecrawl tool) -> Sarvam TTS
+// ---------------------------------------------------------------------------
+
+type ChatTurn = { role: 'user' | 'assistant'; content: string }
+
+const ChatBodySchema = z.object({
+  deviceId: z.string().min(1).max(64),
+  text: z.string().min(1).max(2000),
+  // Optional BCP-47 hint that we forward to Sarvam Bulbul. The agent itself
+  // mirrors the user's language regardless; this only steers the TTS voice.
+  language_code: z.string().min(2).max(10).optional(),
+  speaker: z.string().min(1).max(32).optional(),
+  // Set true to wipe per-device history before this turn (e.g. wake word).
+  reset: z.boolean().optional(),
+})
+
+app.post('/chat', async (c) => {
+  if (!c.env.SARVAM_API_KEY) {
+    throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured' })
+  }
+  if (!c.env.OPENAI_API_KEY) {
+    throw new HTTPException(500, { message: 'OPENAI_API_KEY is not configured' })
+  }
+  if (!c.env.FIRECRAWL_API_KEY) {
+    throw new HTTPException(500, { message: 'FIRECRAWL_API_KEY is not configured' })
+  }
+  if (!c.env.SESSIONS) {
+    throw new HTTPException(500, { message: 'SESSIONS KV binding is missing' })
+  }
+
+  const raw = await c.req.json().catch(() => null)
+  const parsed = ChatBodySchema.safeParse(raw)
+  if (!parsed.success) {
+    throw new HTTPException(400, {
+      message: 'Invalid /chat body: ' + parsed.error.issues.map((i) => i.message).join('; '),
+    })
+  }
+  const { deviceId, text, reset } = parsed.data
+  const languageCode = parsed.data.language_code ?? SARVAM_TTS_DEFAULT_LANG
+  const speaker = parsed.data.speaker ?? SARVAM_TTS_DEFAULT_SPEAKER
+
+  const histKey = `hist:${deviceId}`
+  const history = reset
+    ? []
+    : ((await c.env.SESSIONS.get<ChatTurn[]>(histKey, 'json')) ?? [])
+
+  const openai = createOpenAI({ apiKey: c.env.OPENAI_API_KEY })
+  const firecrawl = new Firecrawl({ apiKey: c.env.FIRECRAWL_API_KEY })
+
+  const webSearch = tool({
+    description:
+      'Search the live web for up-to-date facts (news, weather, prices, sports, anything time-sensitive). ' +
+      'Use only when the user asks for something the model cannot reliably know from training data.',
+    inputSchema: z.object({
+      query: z.string().min(2).max(200).describe('Concise search query in English or the user language.'),
+      limit: z.number().int().min(1).max(4).default(3),
+    }),
+    execute: async ({ query, limit }) => {
+      try {
+        const res = await firecrawl.search(query, {
+          limit,
+          scrapeOptions: { formats: ['markdown'], onlyMainContent: true },
+        })
+        const items = (res.web ?? []) as Array<{
+          url?: string
+          title?: string
+          description?: string
+          markdown?: string
+        }>
+        return items.slice(0, limit).map((r) => ({
+          title: r.title ?? '',
+          url: r.url ?? '',
+          snippet: ((r.markdown ?? r.description ?? '') || '').slice(0, 1200),
+        }))
+      } catch (err) {
+        return {
+          error: 'web_search_failed',
+          detail: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+  })
+
+  const systemPrompt =
+    "You are EvE, a friendly desk robot. Reply in 1 to 3 short sentences " +
+    "suitable for spoken audio. Never use markdown, bullet lists, code fences, " +
+    "URLs, or emojis - the reply will be read out loud by a TTS engine. " +
+    "If a fact is time sensitive (today, latest, current, live, now) call the " +
+    "webSearch tool first and cite the answer succinctly. " +
+    "Speak the same language the user used. " +
+    `Hard limit: never exceed ${SARVAM_TTS_CHAR_LIMIT} characters.`
+
+  let reply: string
+  try {
+    const result = await generateText({
+      model: openai(OPENAI_MODEL),
+      system: systemPrompt,
+      messages: [...history, { role: 'user', content: text }],
+      tools: { webSearch },
+      stopWhen: stepCountIs(3),
+      temperature: 0.4,
+    })
+    reply = result.text.trim()
+  } catch (err) {
+    console.error('agent generateText failed:', err)
+    throw new HTTPException(502, {
+      message: 'Agent failed: ' + (err instanceof Error ? err.message : String(err)),
+    })
+  }
+
+  if (!reply) reply = 'Sorry, I did not catch that. Could you say it again?'
+  if (reply.length > SARVAM_TTS_CHAR_LIMIT) reply = reply.slice(0, SARVAM_TTS_CHAR_LIMIT)
+
+  const newHist: ChatTurn[] = [
+    ...history,
+    { role: 'user' as const, content: text },
+    { role: 'assistant' as const, content: reply },
+  ].slice(-MAX_HISTORY_MESSAGES)
+
+  c.executionCtx.waitUntil(
+    c.env.SESSIONS.put(histKey, JSON.stringify(newHist), { expirationTtl: HISTORY_TTL_SECONDS })
+  )
+
+  let ttsResp: Response
+  try {
+    ttsResp = await fetch(SARVAM_TTS_URL, {
+      method: 'POST',
+      headers: {
+        'api-subscription-key': c.env.SARVAM_API_KEY,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: reply,
+        target_language_code: languageCode,
+        model: SARVAM_TTS_MODEL,
+        speaker,
+        speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
+        pace: 1.0,
+      }),
+    })
+  } catch (err) {
+    throw new HTTPException(502, {
+      message: 'Failed to reach Sarvam TTS: ' + (err instanceof Error ? err.message : String(err)),
+    })
+  }
+
+  if (!ttsResp.ok) {
+    const detail = await ttsResp.text()
+    throw new HTTPException(502, { message: `Sarvam TTS error ${ttsResp.status}: ${detail}` })
+  }
+
+  const ttsJson = (await ttsResp.json().catch(() => null)) as { audios?: string[] } | null
+  if (!ttsJson?.audios?.length) {
+    throw new HTTPException(502, { message: 'Sarvam TTS returned no audio' })
+  }
+
+  const wav = decodeBase64Wav(ttsJson.audios.join(''))
+
+  return new Response(wav, {
+    status: 200,
+    headers: {
+      'content-type': 'audio/wav',
+      'content-length': String(wav.byteLength),
+      'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
+      'x-history-len': String(newHist.length),
+      'cache-control': 'no-store',
+    },
+  })
 })
 
 app.onError((err, c) => {
@@ -277,4 +469,16 @@ function writeString(view: DataView, offset: number, str: string): void {
   for (let i = 0; i < str.length; i++) {
     view.setUint8(offset + i, str.charCodeAt(i))
   }
+}
+
+/**
+ * Decode a base64 string into a Uint8Array. Workers ship `atob` natively but
+ * `Buffer` is not available without nodejs_compat enabled, and even then
+ * skipping it keeps the worker bundle smaller.
+ */
+function decodeBase64Wav(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+  return out
 }
