@@ -51,8 +51,8 @@ const SARVAM_TTS_MODEL = 'bulbul:v3'
 /** Defaults aligned with Sarvam streaming hi-IN preset (ESP uses linear16, not mp3). */
 const SARVAM_TTS_DEFAULT_SPEAKER = 'simran'
 const SARVAM_TTS_DEFAULT_LANG = 'hi-IN'
-/** Speech bandwidth: 8 kHz sounds telephone-muffled; 22050 Hz is a good ESP32/I2S tradeoff vs 24k. */
-const SARVAM_TTS_SAMPLE_RATE = 22050
+/** Speech bandwidth: 8 kHz sounds telephone-muffled; 24000 Hz is a good ESP32/I2S tradeoff vs 24k. */
+const SARVAM_TTS_SAMPLE_RATE = 24000
 const SARVAM_TTS_PACE = 1.2
 const SARVAM_TTS_ENABLE_PREPROCESSING = true
 /** Must stay linear16 for Open EvE firmware I2S playback. */
@@ -104,7 +104,7 @@ app.get('/', (c) =>
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
       'POST /chat':
-        'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 22050 Hz); reply text in x-reply-text (optional ?envelope=1 for JSON prefix + PCM)',
+        'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 24000 Hz); reply text in x-reply-text (optional ?envelope=1 for JSON prefix + PCM)',
     },
   })
 )
@@ -157,8 +157,8 @@ app.post('/transcribe', async (c) => {
     if (channels < 1 || channels > 2) {
       throw new HTTPException(400, { message: 'channels must be 1 or 2' })
     }
-    if (sampleRate < 8000 || sampleRate > 48000) {
-      throw new HTTPException(400, { message: 'sample_rate must be between 8000 and 48000' })
+    if (sampleRate < 8000 || sampleRate > 24000) {
+      throw new HTTPException(400, { message: 'sample_rate must be between 8000 and 24000' })
     }
 
     const buf = await c.req.arrayBuffer()

@@ -171,7 +171,7 @@ them after the first flash; tune buffers if anything trips.
    ```
    [chat] POST /chat (NN text bytes)
    [chat] reply preview (urlenc): The%20weather%20in%20Delhi…
-   [chat] done: 480000 PCM bytes (cl=480044, remain=0), total 4500 ms, first audio +1500 ms
+   [chat] done: 240000 PCM bytes (cl=480044, remain=0), total 4500 ms, first audio +1500 ms
    ```
 
    Audio should start coming out of the speaker within ~1.5 s of the POST

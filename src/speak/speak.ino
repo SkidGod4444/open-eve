@@ -22,7 +22,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define I2S_OUT_SD   21
 
 #define SAMPLE_RATE_MIC 16000
-#define SAMPLE_RATE_OUT 22050
+#define SAMPLE_RATE_OUT 24000
 
 #define BUFFER_SIZE 1024
 
@@ -221,7 +221,7 @@ void setupI2SSpeaker() {
   i2s_set_pin(I2S_NUM_1, &pins);
   i2s_zero_dma_buffer(I2S_NUM_1);
 
-  Serial.println("[I2S SPEAKER] ready (22050 Hz — match Worker x-pcm-sample-rate)");
+  Serial.println("[I2S SPEAKER] ready (24000 Hz — match Worker x-pcm-sample-rate)");
 }
 
 void connectWiFi() {
