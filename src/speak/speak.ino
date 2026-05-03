@@ -40,6 +40,10 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define OPEN_EVE_HARDWARE_WAKE_GPIO -1
 #endif
 
+#if OPEN_EVE_REQUIRE_WAKE_WORD && OPEN_EVE_HARDWARE_WAKE_GPIO < 0
+#warning Open EvE: transcript wake uses Sarvam /transcribe on every loud utterance. Set OPEN_EVE_HARDWARE_WAKE_GPIO>=0 for no cloud STT until wake button, or say wake+command in one sentence (still one STT).
+#endif
+
 // ===== MIC (I2S0) =====
 #define I2S_WS    15
 #define I2S_SCK   16
@@ -288,7 +292,11 @@ static int peakAbsChunk(const int16_t* buf, int samples) {
   return peak;
 }
 
-// ================= STT (HTTPClient OK for short JSON body) =================
+// ================= STT: one /transcribe per VAD utterance (Sarvam) =================
+// PCM → text always needs speech recognition. This firmware does not run a second STT for “wake”
+// vs “command” — there is a single POST with the whole clip. Wake checks are string rules on that
+// transcript (no extra Sarvam call). To avoid paying STT on random room noise, use
+// OPEN_EVE_HARDWARE_WAKE_GPIO (no upload until armed) or on-device wake (ESP-SR / WakeNet).
 String sendSTT(int16_t* audio, int samples) {
   WiFiClientSecure tls;
   tls.setInsecure();
