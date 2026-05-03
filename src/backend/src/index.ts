@@ -5,6 +5,7 @@ import { HTTPException } from 'hono/http-exception'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { generateText, stepCountIs, tool } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
+import { APICallError } from '@ai-sdk/provider'
 import Firecrawl from '@mendable/firecrawl-js'
 import { z } from 'zod'
 
@@ -14,7 +15,8 @@ import { z } from 'zod'
  * Endpoints:
  *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
  *   POST /chat        Text -> agent (Vercel AI SDK + OpenAI + Firecrawl
- *                     web search tool) -> Sarvam Bulbul v3 TTS -> WAV.
+ *                     web search tool) -> Sarvam Bulbul v3 TTS -> raw PCM
+ *                     (24 kHz mono s16le, application/octet-stream, chunked).
  *                     Conversation history (last 6 turns) is kept in
  *                     Cloudflare KV per `deviceId`.
  *
@@ -43,6 +45,7 @@ const SARVAM_TTS_MODEL = 'bulbul:v3'
 const SARVAM_TTS_DEFAULT_SPEAKER = 'shubh'
 const SARVAM_TTS_DEFAULT_LANG = 'en-IN'
 const SARVAM_TTS_SAMPLE_RATE = 24000
+const SARVAM_TTS_PCM_CHUNK_BYTES = 8192 // ReadableStream enqueue size (downstream chunked TE)
 const SARVAM_TTS_CHAR_LIMIT = 1800 // bulbul:v3 caps at 2500; keep headroom for safety
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
 const MAX_HISTORY_MESSAGES = 12 // 6 user + 6 assistant turns
@@ -79,7 +82,7 @@ app.get('/', (c) =>
       'GET /': 'this index',
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
-      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> audio/wav',
+      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> PCM s16le 24k mono',
     },
   })
 )
@@ -204,7 +207,7 @@ app.post('/transcribe', async (c) => {
 })
 
 // ---------------------------------------------------------------------------
-// /chat : transcript -> agent (Vercel AI SDK + Firecrawl tool) -> Sarvam TTS
+// /chat : transcript -> agent (Vercel AI SDK + Firecrawl tool) -> Sarvam TTS -> PCM stream
 // ---------------------------------------------------------------------------
 
 type ChatTurn = { role: 'user' | 'assistant'; content: string }
@@ -224,7 +227,8 @@ app.post('/chat', async (c) => {
   if (!c.env.SARVAM_API_KEY) {
     throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured' })
   }
-  if (!c.env.OPENHORIZON_API_KEY) {
+  const openHorizonApiKey = bindingSecret(c.env.OPENHORIZON_API_KEY)
+  if (!openHorizonApiKey) {
     throw new HTTPException(500, { message: 'OPENHORIZON_API_KEY is not configured' })
   }
   if (!c.env.FIRECRAWL_API_KEY) {
@@ -250,7 +254,10 @@ app.post('/chat', async (c) => {
     ? []
     : ((await c.env.SESSIONS.get<ChatTurn[]>(histKey, 'json')) ?? [])
 
-  const openai = createOpenAI({ baseURL: "https://api.openhorizon.devwtf.in/v1", apiKey: c.env.OPENHORIZON_API_KEY })
+  const openai = createOpenAI({
+    baseURL: 'https://api.openhorizon.devwtf.in/v1',
+    apiKey: openHorizonApiKey,
+  })
   const firecrawl = new Firecrawl({ apiKey: c.env.FIRECRAWL_API_KEY })
 
   const webSearch = tool({
@@ -299,7 +306,9 @@ app.post('/chat', async (c) => {
   let reply: string
   try {
     const result = await generateText({
-      model: openai(OPENHORIZON_MODEL),
+      // Use Chat Completions (`/v1/chat/completions`). The callable `openai(...)`
+      // defaults to the Responses API (`/v1/responses`), which OpenHorizon does not expose.
+      model: openai.chat(OPENHORIZON_MODEL),
       system: systemPrompt,
       messages: [...history, { role: 'user', content: text }],
       tools: { webSearch },
@@ -310,7 +319,7 @@ app.post('/chat', async (c) => {
   } catch (err) {
     console.error('agent generateText failed:', err)
     throw new HTTPException(502, {
-      message: 'Agent failed: ' + (err instanceof Error ? err.message : String(err)),
+      message: 'Agent failed: ' + formatAgentError(err),
     })
   }
 
@@ -342,6 +351,7 @@ app.post('/chat', async (c) => {
         speaker,
         speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
         pace: 1.0,
+        output_audio_codec: 'linear16',
       }),
     })
   } catch (err) {
@@ -360,16 +370,16 @@ app.post('/chat', async (c) => {
     throw new HTTPException(502, { message: 'Sarvam TTS returned no audio' })
   }
 
-  const wav = decodeBase64Wav(ttsJson.audios.join(''))
+  const pcm = pcmPayloadFromTtsAudios(ttsJson.audios)
+  const stream = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
 
-  return new Response(wav, {
+  return new Response(stream, {
     status: 200,
     headers: {
-      'content-type': 'audio/wav',
-      'content-length': String(wav.byteLength),
+      'content-type': 'application/octet-stream',
+      'cache-control': 'no-cache',
       'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
       'x-history-len': String(newHist.length),
-      'cache-control': 'no-store',
     },
   })
 })
@@ -387,6 +397,31 @@ export default app
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Trim Worker secrets — pasted keys often include accidental newlines. */
+function bindingSecret(value: string | undefined): string {
+  return String(value ?? '').trim()
+}
+
+function formatAgentError(err: unknown): string {
+  if (APICallError.isInstance(err)) {
+    const bits: string[] = [err.message]
+    const body = err.responseBody?.trim()
+    if (body && body.length > 0 && body.length <= 800 && !bits[0].includes(body)) {
+      bits.push(body)
+    }
+    const unauthorized =
+      err.statusCode === 401 || /\bunauthorized\b/i.test(bits.join(' '))
+    if (unauthorized) {
+      bits.push(
+        'OpenHorizon expects Authorization: Bearer <key> (the AI SDK does this automatically). ' +
+          'Update the key with wrangler secret put OPENHORIZON_API_KEY (prod) or add OPENHORIZON_API_KEY=… to .dev.vars for wrangler dev — Wrangler does not read .env.'
+      )
+    }
+    return bits.join(' ')
+  }
+  return err instanceof Error ? err.message : String(err)
+}
 
 function parseIntParam(value: string | undefined, fallback: number): number {
   if (value === undefined || value === '') return fallback
@@ -472,13 +507,75 @@ function writeString(view: DataView, offset: number, str: string): void {
 }
 
 /**
- * Decode a base64 string into a Uint8Array. Workers ship `atob` natively but
- * `Buffer` is not available without nodejs_compat enabled, and even then
- * skipping it keeps the worker bundle smaller.
+ * Decode base64 to bytes (Workers `atob`; no Node Buffer).
  */
-function decodeBase64Wav(b64: string): Uint8Array {
+function decodeBase64Binary(b64: string): Uint8Array {
   const bin = atob(b64)
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
   return out
+}
+
+function readFourCC(d: DataView, absoluteByteOffset: number): string {
+  let s = ''
+  for (let i = 0; i < 4; i++) s += String.fromCharCode(d.getUint8(absoluteByteOffset + i))
+  return s
+}
+
+/** If Sarvam returns WAV despite `linear16`, return only the `data` chunk payload. */
+function stripWavHeaderIfPresent(input: Uint8Array): Uint8Array {
+  if (input.byteLength < 12) return input
+  const abs0 = input.byteOffset
+  const d = new DataView(input.buffer)
+  if (readFourCC(d, abs0) !== 'RIFF' || readFourCC(d, abs0 + 8) !== 'WAVE') return input
+
+  let o = abs0 + 12
+  const absEnd = abs0 + input.byteLength
+  while (o + 8 <= absEnd) {
+    const id = readFourCC(d, o)
+    const chunkSize = d.getUint32(o + 4, true)
+    const dataAbs = o + 8
+    const nextChunk = dataAbs + chunkSize + (chunkSize & 1)
+    if (id === 'data') {
+      const rel0 = dataAbs - abs0
+      const rel1 = Math.min(dataAbs + chunkSize - abs0, input.byteLength)
+      return input.subarray(rel0, rel1)
+    }
+    o = nextChunk
+  }
+  return input
+}
+
+function pcmPayloadFromTtsAudios(audios: string[]): Uint8Array {
+  const parts: Uint8Array[] = []
+  let total = 0
+  for (const b64 of audios) {
+    const raw = decodeBase64Binary(b64)
+    const pcm = stripWavHeaderIfPresent(raw)
+    parts.push(pcm)
+    total += pcm.byteLength
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const p of parts) {
+    out.set(p, offset)
+    offset += p.byteLength
+  }
+  return out
+}
+
+/** Chunked Transfer-Encoding to the client; avoids one huge body write. */
+function streamUint8ArrayInChunks(buffer: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
+  let offset = 0
+  return new ReadableStream({
+    pull(controller) {
+      if (offset >= buffer.byteLength) {
+        controller.close()
+        return
+      }
+      const end = Math.min(offset + chunkSize, buffer.byteLength)
+      controller.enqueue(buffer.subarray(offset, end))
+      offset = end
+    },
+  })
 }

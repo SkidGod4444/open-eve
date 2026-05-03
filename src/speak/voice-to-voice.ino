@@ -5,7 +5,7 @@
 //   Core 0:
 //     vad_task        - I2S capture + adaptive energy VAD. Hands a finalized
 //                       utterance buffer to net_task via utt_queue.
-//     merge_task      - Accumulates transcripts, POSTs to /chat, streams WAV
+//     merge_task      - Accumulates transcripts, POSTs to /chat, streams PCM
 //                       into audio_ring (HTTP + resample). Kept off core 1 so
 //                       net_task is not starved during long TTS downloads.
 //     bt source task  - Owned by the ESP32-A2DP library. Pulls 44.1 kHz
@@ -110,7 +110,7 @@ static const char* BACKEND_HOST = "https://backend.dev1974sai.workers.dev";
 static const char* STT_PATH = "/transcribe?sample_rate=16000&channels=1"
                               "&bits_per_sample=16&language_code=en-IN&mode=transcribe";
 
-// /chat takes JSON {deviceId, text} and returns audio/wav. We construct the
+// /chat takes JSON {deviceId, text} and returns raw PCM (24 kHz mono s16le, chunked).
 // deviceId from the MAC address at boot.
 static const char* CHAT_PATH = "/chat";
 
@@ -746,14 +746,14 @@ static void postChatAndStream(const String& merged) {
 
   HTTPClient http;
   http.setReuse(false);
-  http.setTimeout(30000);
+  http.setTimeout(180000);
   String url = String(BACKEND_HOST) + CHAT_PATH;
   if (!http.begin(tls, url)) {
     LOGLN("[chat] http.begin failed");
     return;
   }
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept", "audio/wav");
+  http.addHeader("Accept", "application/octet-stream");
 
   // We want to read X-Reply-Text from the response.
   static const char* kResponseHeaders[] = { "X-Reply-Text" };
@@ -801,57 +801,22 @@ static void postChatAndStream(const String& merged) {
     return;
   }
 
-  // ---- Parse 44-byte WAV header ----
-  uint8_t hdr[44];
-  size_t hdr_read = 0;
-  unsigned long hdr_deadline = millis() + 8000;
-  while (hdr_read < sizeof(hdr) && millis() < hdr_deadline) {
-    if (stream->available()) {
-      int n = stream->read(hdr + hdr_read, sizeof(hdr) - hdr_read);
-      if (n > 0) hdr_read += n;
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(2));
-    }
-  }
-  if (hdr_read != sizeof(hdr) ||
-      memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
-    LOGLN("[chat] bad WAV header");
-    http.end();
-    return;
-  }
-  uint16_t fmt_channels = (uint16_t)hdr[22] | ((uint16_t)hdr[23] << 8);
-  uint32_t fmt_rate     = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8) |
-                          ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
-  uint16_t fmt_bits     = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
-
-  if (fmt_channels != 1 || fmt_rate != 24000 || fmt_bits != 16) {
-    LOGF("[chat] unexpected WAV format: ch=%u rate=%u bits=%u\n",
-         fmt_channels, fmt_rate, fmt_bits);
-    http.end();
-    return;
-  }
-
-  // ---- Stream samples through the resampler into audio_ring ----
+  // Raw PCM @ 24 kHz mono s16le — no WAV container (backend streams chunked octet-stream).
   resamplerReset();
-  static const size_t CHUNK = 1024; // 512 mono samples = 21.3 ms @ 24k
+  static const size_t CHUNK = 1024;
   uint8_t buf[CHUNK];
   int16_t mono[CHUNK / 2];
   size_t total_pcm_bytes = 0;
-  unsigned long stream_deadline = millis() + 30000;
+  unsigned long stream_deadline = millis() + 120000;
   unsigned long t_first_audio = 0;
 
-  // Use Content-Length to know exactly how many PCM bytes follow the header,
-  // so we don't truncate the tail when the remote closes the socket but
-  // bytes still sit in the local TCP buffer.
   int content_length = http.getSize(); // -1 if chunked / unknown
-  size_t pcm_remaining = (content_length > (int)sizeof(hdr))
-                           ? (size_t)(content_length - (int)sizeof(hdr))
-                           : 0;
+  size_t pcm_remaining = content_length > 0 ? (size_t)content_length : 0;
 
   while (millis() < stream_deadline) {
     int avail = stream->available();
     if (avail <= 0) {
-      if (!http.connected()) break; // remote closed and local buffer drained
+      if (!http.connected()) break;
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
@@ -869,7 +834,15 @@ static void postChatAndStream(const String& merged) {
     }
     if (n & 1) n--;
     if (n <= 0) continue;
-    if (!t_first_audio) t_first_audio = millis();
+
+    if (!t_first_audio) {
+      t_first_audio = millis();
+      if (n >= 4 && memcmp(buf, "RIFF", 4) == 0) {
+        LOGLN("[chat] unexpected RIFF header (expected raw PCM)");
+        http.end();
+        return;
+      }
+    }
 
     size_t mono_count = (size_t)n / 2;
     for (size_t i = 0; i < mono_count; i++) {
