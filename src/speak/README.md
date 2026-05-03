@@ -24,7 +24,7 @@ listening even while a reply is playing.
 | ESP32 dev board (classic)     | **must** be classic ESP32 (WROOM/WROVER). ESP32-S3 has no A2DP. |
 | ESP32-WROVER (PSRAM)          | strongly recommended; lets you raise `MAX_UTTERANCE_SECONDS`. |
 | INMP441 I2S mic               | wired WS=GPIO25, SD=GPIO33, SCK=GPIO26.                |
-| Bluetooth speaker             | any A2DP sink. Set `BT_SPEAKER_NAME` to its exact name.|
+| Bluetooth speaker             | any A2DP sink. Tune `BT_SPEAKER_SUBSTRING` to a unique part of the advertised name (Serial shows `[BT scan]` lines).|
 | 5 V USB power supply          | the BT stack + Wi-Fi + I2S together can pull >300 mA. |
 
 ## Toolchain
@@ -99,7 +99,7 @@ Open [`speech-to-text.ino`](./speech-to-text.ino) and edit the top constants:
 | ------------------- | ------------------------------------------------------------ |
 | `WIFI_SSID` / `WIFI_PASS` | Your 2.4 GHz Wi-Fi (the ESP32 cannot use 5 GHz).         |
 | `BACKEND_HOST`      | Your Cloudflare Worker URL (`https://...workers.dev`).        |
-| `BT_SPEAKER_NAME`   | Exact advertised name of your Bluetooth speaker.              |
+| `BT_SPEAKER_SUBSTRING`   | Case-sensitive substring inside the speaker’s Bluetooth name (e.g. `Stone 350 Pro` for boAt Stone Stone 350 Pro). Serial logs every candidate. |
 | `MAX_UTTERANCE_SECONDS` | 2 (default) – raise to 3-4 only with PSRAM.               |
 | `MIC_SHIFT`         | 11 (default). Lower = louder. See header comments.           |
 
@@ -129,7 +129,7 @@ them after the first flash; tune buffers if anything trips.
    utterance pool: 2 x 65536 bytes (2 s each). free=…
    WiFi connected, IP: 192.168.…
    Mic ready
-   A2DP source started, scanning for 'Stone 350 Pro'...
+   A2DP source started, scanning for 'Stone Stone 350 Pro'...
    Voice agent ready. frame=20ms preroll=300ms hangover=700ms ...
    ```
 
