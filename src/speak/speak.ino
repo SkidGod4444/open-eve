@@ -22,9 +22,36 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define I2S_OUT_SD   21
 
 #define SAMPLE_RATE_MIC 16000
-#define SAMPLE_RATE_OUT 22050
+#define SAMPLE_RATE_OUT 8000
 
 #define BUFFER_SIZE 1024
+
+#ifndef MIC_SAMPLE_RIGHT_SHIFT
+/** I2S RX is 32-bit slot; lower value = hotter mic (catch quiet speech). Try 13–15. */
+#define MIC_SAMPLE_RIGHT_SHIFT 13
+#endif
+
+#ifndef STT_MAX_CAPTURE_SAMPLES
+/** Upper bound @ 16 kHz (~3.5 s). Keeps malloc size sane on ESP32-S3 with WiFi+TLS. */
+#define STT_MAX_CAPTURE_SAMPLES 56000
+#endif
+#ifndef STT_MIN_CAPTURE_SAMPLES
+/** Require at least this much audio before silence can end capture (avoid cutting first word). */
+#define STT_MIN_CAPTURE_SAMPLES 14000
+#endif
+#ifndef STT_END_SILENCE_MS
+/** Stop recording after this many ms below STT_END_SILENCE_PEAK (end of utterance). */
+#define STT_END_SILENCE_MS 850
+#endif
+#ifndef STT_END_SILENCE_PEAK
+/** Chunk peak below this counts as silence for endpoint (tune vs room noise). */
+#define STT_END_SILENCE_PEAK 720
+#endif
+
+#ifndef MIC_PREFILL_DISCARD_SAMPLES
+/** Discard after VAD trigger to flush stale FIFO samples before STT buffer. */
+#define MIC_PREFILL_DISCARD_SAMPLES 1024
+#endif
 
 #ifndef CHAT_HTTP_TIMEOUT_MS
 #define CHAT_HTTP_TIMEOUT_MS 180000
@@ -38,12 +65,12 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #endif
 
 #ifndef VAD_PEAK_THRESHOLD
-#define VAD_PEAK_THRESHOLD 2800
+#define VAD_PEAK_THRESHOLD 1900
 #endif
 
-/** Max PCM body size when using buffered mode (mode 0). */
+/** Max PCM body for /chat buffered mode — heap; lower if Worker TLS fails OOM on S3. */
 #ifndef CHAT_PCM_MAX_BYTES
-#define CHAT_PCM_MAX_BYTES (640 * 1024)
+#define CHAT_PCM_MAX_BYTES (448 * 1024)
 #endif
 
 /**
@@ -54,10 +81,17 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define CHAT_PCM_PLAY_MODE 0
 #endif
 
+#if CHAT_PCM_PLAY_MODE != 0
 #ifndef PCM_JITTER_BYTES
-#define PCM_JITTER_BYTES 57344
+#define PCM_JITTER_BYTES 32768
 #endif
-/** Stream mode: minimum queued PCM before first I2S write (~128 ms @ 22.05 kHz when 6144). */
+#else
+/** Buffered playback mode: jitter ring unused — tiny placeholder saves ~53 KB SRAM for WiFi. */
+#ifndef PCM_JITTER_BYTES
+#define PCM_JITTER_BYTES 4096
+#endif
+#endif
+/** Stream mode: minimum queued PCM before first I2S write (~384 ms @ 8 kHz when 6144). */
 #ifndef PCM_STREAM_PREFILL_BYTES
 #define PCM_STREAM_PREFILL_BYTES 6144
 #endif
@@ -84,18 +118,28 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
  * Stream mode (1): jitter ring — still one continuous utterance, not “packet speech”. */
 
 #ifndef PCM_NORMALIZE_PEAK_TARGET
-/** Loudest clean int16 peak before optional PLAYBACK_GAIN_PERCENT (32767 = absolute max). */
+/** Peak-normalize clip to this before boost / I2S (32767 = max int16). */
 #define PCM_NORMALIZE_PEAK_TARGET 32767
 #endif
 #ifndef PCM_NORMALIZE_NOISE_FLOOR
-/** Below this peak abs sample, skip normalization (avoid blasting hiss). */
-#define PCM_NORMALIZE_NOISE_FLOOR 48
+/** Below this abs peak in clip, skip normalization (quiet TTS still scales if above floor). */
+#define PCM_NORMALIZE_NOISE_FLOOR 22
 #endif
 
-/** Applied after peak-normalize (100 = unity). Use >100 only if you accept clipping (“overdrive”). */
-#ifndef PLAYBACK_GAIN_PERCENT
-#define PLAYBACK_GAIN_PERCENT 200
+/** Extra digital push after normalize (buffered mode): lifts RMS; peaks clip — louder but hotter. */
+#ifndef PCM_SATURATE_BOOST_PERCENT
+#define PCM_SATURATE_BOOST_PERCENT 132
 #endif
+
+/** I2S write gain: buffered path uses lower value because saturate boost already ran. */
+#ifndef BUFFERED_PLAYBACK_GAIN_PERCENT
+#define BUFFERED_PLAYBACK_GAIN_PERCENT 118
+#endif
+#ifndef STREAM_PLAYBACK_GAIN_PERCENT
+#define STREAM_PLAYBACK_GAIN_PERCENT 680
+#endif
+
+static unsigned g_pcmWriteGainPct = STREAM_PLAYBACK_GAIN_PERCENT;
 
 // Must match setupI2SSpeaker() — used to flush real silence through TX DMA (stops last-sample “stuck”).
 #ifndef I2S_SPEAKER_DMA_BUF_COUNT
@@ -108,6 +152,24 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 int32_t rawBuffer[BUFFER_SIZE];
 static int32_t txSlots[BUFFER_SIZE];
 
+/** Heap allocation after WiFi — avoids reserving ~112 KB BSS before WiFi.begin() (ESP32-S3 OOM/crash). */
+static int16_t* g_sttCapturePcm = nullptr;
+
+static bool allocSttCaptureBuffer() {
+  if (g_sttCapturePcm)
+    return true;
+  size_t nb = (size_t)STT_MAX_CAPTURE_SAMPLES * sizeof(int16_t);
+  g_sttCapturePcm = (int16_t*)malloc(nb);
+  if (!g_sttCapturePcm) {
+    Serial.printf("[ERR] STT malloc %u fail heap=%u\n", (unsigned)nb,
+                  (unsigned)ESP.getFreeHeap());
+    return false;
+  }
+  Serial.printf("[STT] capture heap OK %u B free=%u\n", (unsigned)nb,
+                (unsigned)ESP.getFreeHeap());
+  return true;
+}
+
 // ================= I2S MIC =================
 void setupI2SMic() {
   i2s_config_t config = {
@@ -117,8 +179,8 @@ void setupI2SMic() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 256
+    .dma_buf_count = 8,
+    .dma_buf_len = 512
   };
 
   i2s_pin_config_t pins = {
@@ -159,15 +221,17 @@ void setupI2SSpeaker() {
   i2s_set_pin(I2S_NUM_1, &pins);
   i2s_zero_dma_buffer(I2S_NUM_1);
 
-  Serial.println("[I2S SPEAKER] ready (22.05 kHz, int16 in 32-bit slots)");
+  Serial.println("[I2S SPEAKER] ready (8 kHz linear16 slots → backend Sarvam stream)");
 }
 
 void connectWiFi() {
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    yield();
   }
   Serial.println("\n[WiFi] connected");
 }
@@ -176,8 +240,23 @@ void readMic(int16_t* out, int samples) {
   size_t bytesRead;
   i2s_read(I2S_NUM_0, rawBuffer, samples * 4, &bytesRead, portMAX_DELAY);
   for (int i = 0; i < samples; i++) {
-    out[i] = rawBuffer[i] >> 14;
+    int32_t s = rawBuffer[i] >> MIC_SAMPLE_RIGHT_SHIFT;
+    if (s > 32767)
+      s = 32767;
+    else if (s < -32768)
+      s = -32768;
+    out[i] = (int16_t)s;
   }
+}
+
+/** Peak absolute sample in int16 buffer (chunk). */
+static int peakAbsChunk(const int16_t* buf, int samples) {
+  int peak = 0;
+  for (int i = 0; i < samples; i++) {
+    int v = abs(buf[i]);
+    if (v > peak) peak = v;
+  }
+  return peak;
 }
 
 // ================= STT (HTTPClient OK for short JSON body) =================
@@ -189,7 +268,9 @@ String sendSTT(int16_t* audio, int samples) {
   http.setReuse(false);
   http.setTimeout(STT_HTTP_TIMEOUT_MS);
 
-  if (!http.begin(tls, BACKEND_HOST, 443, "/transcribe", true)) {
+  String path = String("/transcribe?sample_rate=") + String(SAMPLE_RATE_MIC) +
+                "&channels=1&bits_per_sample=16";
+  if (!http.begin(tls, BACKEND_HOST, 443, path.c_str(), true)) {
     Serial.println("[STT] http.begin failed");
     return "";
   }
@@ -409,6 +490,19 @@ static void normalizePcmS16FullScale(int16_t* s, size_t nSamp) {
                 (long)peak, PCM_NORMALIZE_PEAK_TARGET);
 }
 
+static void pcmSaturateBoostInPlace(int16_t* s, size_t nSamp, unsigned pct) {
+  if (nSamp == 0 || pct == 100)
+    return;
+  for (size_t i = 0; i < nSamp; i++) {
+    int64_t x = ((int64_t)s[i] * (int64_t)pct) / 100;
+    if (x > 32767)
+      x = 32767;
+    else if (x < -32768)
+      x = -32768;
+    s[i] = (int16_t)x;
+  }
+}
+
 /** Drain entire PCM buffer to I2S in slices — never truncate after txSlots samples. */
 static void writePcmBytesToI2s(uint8_t* buf, size_t len, bool* checkedWav) {
   if (len & 1) len--;
@@ -427,7 +521,7 @@ static void writePcmBytesToI2s(uint8_t* buf, size_t len, bool* checkedWav) {
     const int16_t* ps = (const int16_t*)buf;
     for (size_t i = 0; i < chunkSamples; i++) {
       int64_t g =
-          ((int64_t)ps[i] * (int64_t)PLAYBACK_GAIN_PERCENT) / 100;
+          ((int64_t)ps[i] * (int64_t)g_pcmWriteGainPct) / 100;
       if (g > 32767)
         g = 32767;
       else if (g < -32768)
@@ -536,8 +630,10 @@ static size_t playBufferedPcmAndSilence() {
                 (unsigned)g_pcmAccumLen, (unsigned)playLen);
 
   i2s_zero_dma_buffer(I2S_NUM_1);
-  if (playLen >= 2)
+  if (playLen >= 2) {
     normalizePcmS16FullScale((int16_t*)playPtr, playLen / 2);
+    pcmSaturateBoostInPlace((int16_t*)playPtr, playLen / 2, PCM_SATURATE_BOOST_PERCENT);
+  }
 
   writePcmBytesToI2s(playPtr, playLen, &checkedWav);
   silenceSpeakerTail();
@@ -710,6 +806,8 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   Serial.printf("[AI] chunked=%d content-length=%ld\n", chunked ? 1 : 0, contentLen);
 
   const bool streamPlay = (CHAT_PCM_PLAY_MODE != 0);
+  g_pcmWriteGainPct =
+      streamPlay ? STREAM_PLAYBACK_GAIN_PERCENT : BUFFERED_PLAYBACK_GAIN_PERCENT;
 
   if (!streamPlay) {
     pcmAccumClear();
@@ -871,10 +969,19 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("[BOOT]");
+  Serial.printf("[BOOT] heap=%u\n", (unsigned)ESP.getFreeHeap());
   connectWiFi();
+  Serial.printf("[BOOT] heap after WiFi=%u\n", (unsigned)ESP.getFreeHeap());
+  if (!allocSttCaptureBuffer()) {
+    Serial.println("[HALT] Out of RAM for voice capture buffer");
+    while (true) {
+      delay(1000);
+      yield();
+    }
+  }
   setupI2SMic();
   setupI2SSpeaker();
-  Serial.println("[READY]");
+  Serial.printf("[READY] heap=%u\n", (unsigned)ESP.getFreeHeap());
 }
 
 void loop() {
@@ -895,14 +1002,53 @@ void loop() {
   }
 
   if (peak > VAD_PEAK_THRESHOLD) {
-    Serial.println("[VOICE DETECTED]");
-
-    static int16_t fullAudio[16000];
-    for (int i = 0; i < 16000; i += BUFFER_SIZE) {
-      readMic(fullAudio + i, BUFFER_SIZE);
+    if (!g_sttCapturePcm) {
+      if (!allocSttCaptureBuffer()) {
+        vadCooldownUntilMs = millis() + 3000;
+        return;
+      }
     }
 
-    String stt = sendSTT(fullAudio, 16000);
+    Serial.println("[VOICE DETECTED]");
+
+    int disc = 0;
+    while (disc < MIC_PREFILL_DISCARD_SAMPLES) {
+      readMic(audio, BUFFER_SIZE);
+      disc += BUFFER_SIZE;
+    }
+
+    size_t totalWritten = 0;
+    unsigned silentRunSamples = 0;
+    const unsigned silentNeedSamples =
+        (unsigned)SAMPLE_RATE_MIC * (unsigned)STT_END_SILENCE_MS / 1000U;
+
+    while (totalWritten < (size_t)STT_MAX_CAPTURE_SAMPLES) {
+      size_t chunk = BUFFER_SIZE;
+      if (totalWritten + chunk > (size_t)STT_MAX_CAPTURE_SAMPLES)
+        chunk = (size_t)STT_MAX_CAPTURE_SAMPLES - totalWritten;
+      if (chunk == 0)
+        break;
+
+      readMic(g_sttCapturePcm + totalWritten, (int)chunk);
+      totalWritten += chunk;
+
+      int pk = peakAbsChunk(g_sttCapturePcm + totalWritten - chunk, (int)chunk);
+      if (pk < STT_END_SILENCE_PEAK)
+        silentRunSamples += (unsigned)chunk;
+      else
+        silentRunSamples = 0;
+
+      if (totalWritten >= (size_t)STT_MIN_CAPTURE_SAMPLES &&
+          silentRunSamples >= silentNeedSamples)
+        break;
+    }
+
+    Serial.printf("[STT] captured %u samples (~%lu ms @ %u Hz)\n",
+                  (unsigned)totalWritten,
+                  (unsigned long)((totalWritten * 1000UL) / (unsigned long)SAMPLE_RATE_MIC),
+                  (unsigned)SAMPLE_RATE_MIC);
+
+    String stt = sendSTT(g_sttCapturePcm, (int)totalWritten);
     Serial.println("[STT] " + stt);
 
     String transcript = transcriptFromSttResponse(stt);

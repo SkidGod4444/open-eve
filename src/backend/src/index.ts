@@ -14,9 +14,10 @@ import { z } from 'zod'
  *
  * Endpoints:
  *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
- *   POST /chat        Text -> agent (Vercel AI SDK + OpenAI + Firecrawl
- *                     web search tool) -> Sarvam Bulbul v3 TTS -> raw PCM
- *                     (22.05 kHz mono s16le, application/octet-stream, chunked).
+ *   POST /chat        Text -> agent -> Sarvam Bulbul v3 **streaming** TTS
+ *                     (`/text-to-speech/stream`) -> mono PCM s16le for ESP32
+ *                     (`linear16`, default 8 kHz). Clients that need MP3 should call
+ *                     Sarvam directly; bare I2S expects PCM only.
  *                     Conversation history (last 6 turns) is kept in
  *                     Cloudflare KV per `deviceId`.
  *
@@ -39,15 +40,18 @@ import { z } from 'zod'
  */
 
 const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text'
-const SARVAM_TTS_URL = 'https://api.sarvam.ai/text-to-speech'
+/** Streaming endpoint (binary audio body); `/chat` proxies PCM to ESP32. */
+const SARVAM_TTS_STREAM_URL = 'https://api.sarvam.ai/text-to-speech/stream'
 const SARVAM_STT_MODEL = 'saaras:v3'
 const SARVAM_TTS_MODEL = 'bulbul:v3'
-/** Defaults aligned with Sarvam Bulbul v3 hi-IN “simran” studio preset (REST body, not Node SDK). */
+/** Defaults aligned with Sarvam streaming hi-IN preset (ESP uses linear16, not mp3). */
 const SARVAM_TTS_DEFAULT_SPEAKER = 'simran'
 const SARVAM_TTS_DEFAULT_LANG = 'hi-IN'
-const SARVAM_TTS_SAMPLE_RATE = 48000
+const SARVAM_TTS_SAMPLE_RATE = 8000
 const SARVAM_TTS_PACE = 1.2
 const SARVAM_TTS_ENABLE_PREPROCESSING = true
+/** Must stay linear16 for Open EvE firmware I2S playback. */
+const SARVAM_TTS_OUTPUT_CODEC = 'linear16' as const
 const SARVAM_TTS_PCM_CHUNK_BYTES = 8192 // ReadableStream enqueue size (downstream chunked TE)
 const SARVAM_TTS_CHAR_LIMIT = 2500 // bulbul:v3 caps at 2500; keep headroom for safety
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
@@ -77,7 +81,7 @@ app.get('/', (c) =>
     description: 'Voice agent for the Open EvE desk robot (ESP32 + mic + BT speaker)',
     upstreams: {
       stt: 'sarvam.ai/speech-to-text (Saaras v3)',
-      tts: 'sarvam.ai/text-to-speech (Bulbul v3)',
+      tts: 'sarvam.ai/text-to-speech/stream (Bulbul v3 → PCM for ESP32)',
       llm: `${OPENHORIZON_MODEL} via Vercel AI SDK`,
       websearch: 'firecrawl.dev /search',
     },
@@ -85,7 +89,7 @@ app.get('/', (c) =>
       'GET /': 'this index',
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
-      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> PCM s16le 22.05k mono',
+      'POST /chat': 'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 8 kHz)',
     },
   })
 )
@@ -210,7 +214,7 @@ app.post('/transcribe', async (c) => {
 })
 
 // ---------------------------------------------------------------------------
-// /chat : transcript -> agent (Vercel AI SDK + Firecrawl tool) -> Sarvam TTS -> PCM stream
+// /chat : agent -> Sarvam streaming TTS -> PCM proxy for ESP32
 // ---------------------------------------------------------------------------
 
 type ChatTurn = { role: 'user' | 'assistant'; content: string }
@@ -218,8 +222,7 @@ type ChatTurn = { role: 'user' | 'assistant'; content: string }
 const ChatBodySchema = z.object({
   deviceId: z.string().min(1).max(64),
   text: z.string().min(1).max(2000),
-  // Optional BCP-47 hint that we forward to Sarvam Bulbul. The agent itself
-  // mirrors the user's language regardless; this only steers the TTS voice.
+  // Optional BCP-47 hint forwarded to Sarvam Bulbul TTS.
   language_code: z.string().min(2).max(10).optional(),
   speaker: z.string().min(1).max(32).optional(),
   pace: z.number().min(0.5).max(2).optional(),
@@ -344,45 +347,64 @@ app.post('/chat', async (c) => {
     c.env.SESSIONS.put(histKey, JSON.stringify(newHist), { expirationTtl: HISTORY_TTL_SECONDS })
   )
 
+  const ttsPayload = {
+    text: reply,
+    target_language_code: languageCode,
+    model: SARVAM_TTS_MODEL,
+    speaker,
+    speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
+    pace: ttsPace,
+    enable_preprocessing: ttsPreprocess,
+    output_audio_codec: SARVAM_TTS_OUTPUT_CODEC,
+  }
+
   let ttsResp: Response
   try {
-    ttsResp = await fetch(SARVAM_TTS_URL, {
+    ttsResp = await fetch(SARVAM_TTS_STREAM_URL, {
       method: 'POST',
       headers: {
         'api-subscription-key': c.env.SARVAM_API_KEY,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({
-        text: reply,
-        target_language_code: languageCode,
-        model: SARVAM_TTS_MODEL,
-        speaker,
-        speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
-        pace: ttsPace,
-        enable_preprocessing: ttsPreprocess,
-        output_audio_codec: 'linear16',
-      }),
+      body: JSON.stringify(ttsPayload),
     })
   } catch (err) {
     throw new HTTPException(502, {
-      message: 'Failed to reach Sarvam TTS: ' + (err instanceof Error ? err.message : String(err)),
+      message: 'Failed to reach Sarvam TTS stream: ' + (err instanceof Error ? err.message : String(err)),
     })
   }
 
   if (!ttsResp.ok) {
     const detail = await ttsResp.text()
-    throw new HTTPException(502, { message: `Sarvam TTS error ${ttsResp.status}: ${detail}` })
+    throw new HTTPException(502, { message: `Sarvam TTS stream error ${ttsResp.status}: ${detail}` })
   }
 
-  const ttsJson = (await ttsResp.json().catch(() => null)) as { audios?: string[] } | null
-  if (!ttsJson?.audios?.length) {
-    throw new HTTPException(502, { message: 'Sarvam TTS returned no audio' })
+  const upstreamCt = (ttsResp.headers.get('content-type') ?? '').toLowerCase()
+
+  if (upstreamCt.includes('application/json')) {
+    const ttsJson = (await ttsResp.json().catch(() => null)) as { audios?: string[] } | null
+    if (!ttsJson?.audios?.length) {
+      throw new HTTPException(502, { message: 'Sarvam TTS returned JSON without audio' })
+    }
+    const pcm = pcmPayloadFromTtsAudios(ttsJson.audios)
+    const stream = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'content-type': 'application/octet-stream',
+        'cache-control': 'no-cache',
+        'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
+        'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
+        'x-history-len': String(newHist.length),
+      },
+    })
   }
 
-  const pcm = pcmPayloadFromTtsAudios(ttsJson.audios)
-  const stream = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
+  if (!ttsResp.body) {
+    throw new HTTPException(502, { message: 'Sarvam TTS stream returned no body' })
+  }
 
-  return new Response(stream, {
+  return new Response(ttsResp.body, {
     status: 200,
     headers: {
       'content-type': 'application/octet-stream',
