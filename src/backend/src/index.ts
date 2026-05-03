@@ -13,30 +13,26 @@ import { z } from 'zod'
  * Open EvE backend - voice agent for the desk robot.
  *
  * Endpoints:
- *   POST /transcribe  Audio -> text via xAI `/v1/stt` (response normalized to transcript + language_code).
+ *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT (passthrough JSON: transcript + language_code).
  *   POST /chat        Text -> agent -> TTS (conditional):
  *                       Indian langs -> Sarvam Bulbul streaming `linear16` PCM.
- *                       Other langs    -> xAI `/v1/tts` PCM @ 24 kHz, voice `eve`.
- *                     Assistant reply in URL-encoded `x-reply-text`. Optional `?envelope=1`.
+ *                       English / international -> xAI `/v1/tts` PCM @ 24 kHz, voice `eve`.
  *                     KV history per `deviceId`.
  *
  * Supported request bodies on POST /transcribe:
- *   1. multipart/form-data with a `file` field (container audio).
+ *   1. multipart/form-data with a `file` field (formats Sarvam accepts).
  *   2. A binary audio file body with Content-Type audio/wav | audio/mpeg |
  *      audio/aac | audio/flac | audio/ogg.
  *   3. Raw little-endian PCM with Content-Type audio/pcm | audio/L16 |
- *      application/octet-stream. Optional query params describe the PCM:
- *        sample_rate     (default 16000)
- *        channels        (default 1)
- *        bits_per_sample (default 16)
- *      The Worker wraps the PCM in a WAV header before forwarding to xAI STT.
+ *      application/octet-stream. Optional query params describe the PCM — Worker wraps WAV for Sarvam.
  *
  * Optional /transcribe query params:
- *   mode          legacy Sarvam values — accepted but ignored (xAI has no equivalent).
- *   language_code When set: passed to xAI as `language` with `format=true` (written-form normalization).
+ *   mode          transcribe (default) | translate | verbatim | translit | codemix — forwarded to Sarvam.
+ *   language_code BCP-47 hint, e.g. hi-IN, en-IN. Forwarded when set.
  */
 
-const XAI_STT_URL = 'https://api.x.ai/v1/stt'
+const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text'
+const SARVAM_STT_MODEL = 'saaras:v3'
 const XAI_TTS_URL = 'https://api.x.ai/v1/tts'
 /** Streaming endpoint (binary audio body); `/chat` proxies PCM to ESP32 for Sarvam path. */
 const SARVAM_TTS_STREAM_URL = 'https://api.sarvam.ai/text-to-speech/stream'
@@ -58,7 +54,7 @@ const DEFAULT_CHAT_LANGUAGE_CODE = 'en'
 const XAI_TTS_VOICE_INTERNATIONAL = 'eve'
 /** Keep total response headers within safe proxy limits (`x-reply-text` is URL-encoded). */
 const CHAT_REPLY_HEADER_MAX_ENCODED_BYTES = 6144
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap (ESP32 payloads are tiny; xAI allows large files)
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB cap; Sarvam sync STT ~30 s practical limit
 const MAX_HISTORY_MESSAGES = 50 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
 const OPENHORIZON_MODEL = 'openhorizon/gemma4:latest'
@@ -107,7 +103,7 @@ app.get('/', (c) =>
     name: 'open-eve-backend',
     description: 'Voice agent for the Open EvE desk robot (ESP32 + mic + BT speaker)',
     upstreams: {
-      stt: 'x.ai/v1/stt',
+      stt: 'sarvam.ai/speech-to-text (Saaras v3)',
       tts_intl: 'x.ai/v1/tts → PCM eve @ 24 kHz',
       tts_in: 'sarvam.ai/text-to-speech/stream (Bulbul v3 → PCM)',
       llm: `${OPENHORIZON_MODEL} via Vercel AI SDK`,
@@ -118,7 +114,7 @@ app.get('/', (c) =>
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
       'POST /chat':
-        'text -> agent -> TTS: Indian langs Sarvam PCM, else xAI eve PCM @ 24 kHz; x-reply-text; optional ?envelope=1',
+        'text -> agent -> TTS: Indian Sarvam PCM; English/intl xAI eve PCM @ 24 kHz; x-reply-text; optional ?envelope=1',
     },
   })
 )
@@ -126,9 +122,8 @@ app.get('/', (c) =>
 app.get('/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
 
 app.post('/transcribe', async (c) => {
-  const xaiKey = bindingSecret(c.env.XAI_API_KEY)
-  if (!xaiKey) {
-    throw new HTTPException(500, { message: 'XAI_API_KEY is not configured on the server' })
+  if (!bindingSecret(c.env.SARVAM_API_KEY)) {
+    throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured on the server' })
   }
 
   const mode = (c.req.query('mode') ?? 'transcribe') as Mode
@@ -137,7 +132,7 @@ app.post('/transcribe', async (c) => {
       message: `Invalid mode '${mode}'. Allowed: ${VALID_MODES.join(', ')}`,
     })
   }
-  const languageHintQuery = (c.req.query('language_code') || '').trim() || undefined
+  const languageCode = c.req.query('language_code') || undefined
 
   const contentTypeHeader = (c.req.header('content-type') ?? '').toLowerCase()
   const baseContentType = contentTypeHeader.split(';')[0].trim()
@@ -205,30 +200,34 @@ app.post('/transcribe', async (c) => {
     })
   }
 
-  const xaiForm = buildXaiSttFormData(audioBlob, filename, languageHintQuery)
+  const sarvamForm = new FormData()
+  sarvamForm.append('model', SARVAM_STT_MODEL)
+  sarvamForm.append('mode', mode)
+  if (languageCode) sarvamForm.append('language_code', languageCode)
+  sarvamForm.append('file', audioBlob, filename)
 
   let upstream: Response
   try {
-    upstream = await fetch(XAI_STT_URL, {
+    upstream = await fetch(SARVAM_STT_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${xaiKey}`,
+        'api-subscription-key': bindingSecret(c.env.SARVAM_API_KEY),
       },
-      body: xaiForm,
+      body: sarvamForm,
     })
   } catch (err) {
     throw new HTTPException(502, {
-      message: `Failed to reach xAI STT API: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Failed to reach Sarvam API: ${err instanceof Error ? err.message : String(err)}`,
     })
   }
 
   const rawBody = await upstream.text()
-  const parsedBody = safeJsonParse(rawBody) as Record<string, unknown> | null
+  const parsedBody = safeJsonParse(rawBody)
 
   if (!upstream.ok) {
     return c.json(
       {
-        error: 'xAI STT returned an error',
+        error: 'Sarvam API returned an error',
         upstream_status: upstream.status,
         upstream_body: parsedBody ?? rawBody,
       },
@@ -236,19 +235,7 @@ app.post('/transcribe', async (c) => {
     )
   }
 
-  const transcript =
-    parsedBody != null && typeof parsedBody.text === 'string'
-      ? parsedBody.text
-      : parsedBody != null && typeof parsedBody.transcript === 'string'
-        ? parsedBody.transcript
-        : ''
-  const detectedName =
-    parsedBody != null && typeof parsedBody.language === 'string' ? parsedBody.language : ''
-
-  return c.json({
-    transcript,
-    language_code: mapXaiDetectedLanguageToCode(detectedName),
-  })
+  return c.json(parsedBody ?? { raw: rawBody })
 })
 
 // ---------------------------------------------------------------------------
@@ -515,70 +502,12 @@ app.onError((err, c) => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** xAI STT returns a display language name; map to BCP-style hints for /chat + firmware. */
-const XAI_STT_LANGUAGE_NAME_TO_HINT: Record<string, string> = {
-  arabic: 'ar',
-  czech: 'cs',
-  danish: 'da',
-  dutch: 'nl',
-  english: 'en',
-  filipino: 'fil',
-  french: 'fr',
-  german: 'de',
-  hindi: 'hi-IN',
-  indonesian: 'id',
-  italian: 'it',
-  japanese: 'ja',
-  korean: 'ko',
-  macedonian: 'mk',
-  malay: 'ms',
-  persian: 'fa',
-  polish: 'pl',
-  portuguese: 'pt',
-  romanian: 'ro',
-  russian: 'ru',
-  spanish: 'es',
-  swedish: 'sv',
-  thai: 'th',
-  turkish: 'tr',
-  vietnamese: 'vi',
-  bengali: 'bn-IN',
-  urdu: 'ur-IN',
-  tamil: 'ta-IN',
-  telugu: 'te-IN',
-  kannada: 'kn-IN',
-  malayalam: 'ml-IN',
-  marathi: 'mr-IN',
-  gujarati: 'gu-IN',
-  punjabi: 'pa-IN',
-  odia: 'or-IN',
-  assamese: 'as-IN',
-}
-
 function primaryLanguageSubtag(languageCodeHint: string): string {
   return languageCodeHint.trim().split(/[-_]/)[0].toLowerCase()
 }
 
 function isIndianLanguage(languageCodeHint: string): boolean {
   return INDIAN_PRIMARY_LANG_TAGS.has(primaryLanguageSubtag(languageCodeHint))
-}
-
-function mapXaiDetectedLanguageToCode(detectedLanguage: string): string {
-  const k = detectedLanguage.trim().toLowerCase()
-  if (!k) return DEFAULT_CHAT_LANGUAGE_CODE
-  return XAI_STT_LANGUAGE_NAME_TO_HINT[k] ?? DEFAULT_CHAT_LANGUAGE_CODE
-}
-
-/** Non-file fields first; `file` must be last per xAI docs. */
-function buildXaiSttFormData(audioBlob: Blob, filename: string, queryLanguageHint?: string): FormData {
-  const fd = new FormData()
-  const hint = queryLanguageHint?.trim()
-  if (hint) {
-    fd.append('format', 'true')
-    fd.append('language', primaryLanguageSubtag(hint))
-  }
-  fd.append('file', audioBlob, filename)
-  return fd
 }
 
 /** Map user/STT language hint to xAI TTS `language` (BCP-ish / `auto`). */
@@ -677,7 +606,7 @@ interface PcmInfo {
 
 /**
  * Build a 44-byte canonical PCM WAV file in front of the supplied samples.
- * xAI STT (and historical Sarvam) expect a container; raw PCM from the ESP32 is wrapped here.
+ * Sarvam rejects raw PCM; the ESP32 streams PCM and the Worker wraps it here.
  */
 function wrapPcmInWav(pcm: Uint8Array, info: PcmInfo): Uint8Array {
   const { sampleRate, channels, bitsPerSample } = info

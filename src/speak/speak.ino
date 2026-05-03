@@ -37,13 +37,49 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #ifndef OPEN_EVE_WAKE_WORD
 #define OPEN_EVE_WAKE_WORD "eve"
 #endif
-/** Devanagari “ईव” (how STT often writes “Eve”) — UTF-8 bytes. */
+/** Devanagari “ईव” (long ई + व) — UTF-8 must use 0xE0 0xA4 (not 0xE0 0xA5) for letters U+0900–U+097F. */
 #ifndef OPEN_EVE_WAKE_WORD_HI_UTF8
-#define OPEN_EVE_WAKE_WORD_HI_UTF8 "\xe0\xa5\x88\xe0\xa5\xb5"
+#define OPEN_EVE_WAKE_WORD_HI_UTF8 "\xe0\xa4\x88\xe0\xa4\xb5"
 #endif
-/** Alternate Hindi spelling “इव” — UTF-8. */
+/** Alternate Hindi “इव” (short इ + व) — usual STT output for spoken “Eve”. */
 #ifndef OPEN_EVE_WAKE_WORD_HI_ALT_UTF8
-#define OPEN_EVE_WAKE_WORD_HI_ALT_UTF8 "\xe0\xa5\x87\xe0\xa5\xb5"
+#define OPEN_EVE_WAKE_WORD_HI_ALT_UTF8 "\xe0\xa4\x87\xe0\xa4\xb5"
+#endif
+/** Odia ଇଭ୍ — Sarvam / common STT spelling for “Eve” (I + consonant cluster + halant). */
+#ifndef OPEN_EVE_WAKE_WORD_OD_UTF8
+#define OPEN_EVE_WAKE_WORD_OD_UTF8 "\xe0\xac\x87\xe0\xac\xad\xe0\xad\x8d"
+#endif
+/** Odia ଇଭ — variant if STT omits trailing halant before punctuation. */
+#ifndef OPEN_EVE_WAKE_WORD_OD_ALT_UTF8
+#define OPEN_EVE_WAKE_WORD_OD_ALT_UTF8 "\xe0\xac\x87\xe0\xac\xad"
+#endif
+/** Bengali ইভ */
+#ifndef OPEN_EVE_WAKE_WORD_BN_UTF8
+#define OPEN_EVE_WAKE_WORD_BN_UTF8 "\xe0\xa6\x87\xe0\xa6\xad"
+#endif
+/** Telugu ఇవ */
+#ifndef OPEN_EVE_WAKE_WORD_TE_UTF8
+#define OPEN_EVE_WAKE_WORD_TE_UTF8 "\xe0\xb0\x87\xe0\xb0\xb5"
+#endif
+/** Kannada ಇವ */
+#ifndef OPEN_EVE_WAKE_WORD_KN_UTF8
+#define OPEN_EVE_WAKE_WORD_KN_UTF8 "\xe0\xb2\x87\xe0\xb2\xb5"
+#endif
+/** Malayalam ഇവ */
+#ifndef OPEN_EVE_WAKE_WORD_ML_UTF8
+#define OPEN_EVE_WAKE_WORD_ML_UTF8 "\xe0\xb4\x87\xe0\xb4\xb5"
+#endif
+/** Tamil இவெ */
+#ifndef OPEN_EVE_WAKE_WORD_TA_UTF8
+#define OPEN_EVE_WAKE_WORD_TA_UTF8 "\xe0\xae\x87\xe0\xae\xb5\xe0\xaf\x87"
+#endif
+/** Gujarati ઇવ */
+#ifndef OPEN_EVE_WAKE_WORD_GU_UTF8
+#define OPEN_EVE_WAKE_WORD_GU_UTF8 "\xe0\xaa\x87\xe0\xaa\xb5"
+#endif
+/** Gurmukhi ਇਵ */
+#ifndef OPEN_EVE_WAKE_WORD_PA_UTF8
+#define OPEN_EVE_WAKE_WORD_PA_UTF8 "\xe0\xa8\x87\xe0\xa8\xb5"
 #endif
 
 /**
@@ -60,7 +96,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #endif
 
 #if OPEN_EVE_REQUIRE_WAKE_WORD && OPEN_EVE_HARDWARE_WAKE_GPIO < 0
-#warning Open EvE: transcript wake uses Worker /transcribe (xAI STT) on every loud utterance. Set OPEN_EVE_HARDWARE_WAKE_GPIO>=0 for no cloud STT until wake button, or say wake+command in one sentence (still one STT).
+#warning Open EvE: transcript wake uses Worker /transcribe (Sarvam STT) on every loud utterance. Set OPEN_EVE_HARDWARE_WAKE_GPIO>=0 for no cloud STT until wake button, or say wake+command in one sentence (still one STT).
 #endif
 
 // ===== MIC (I2S0) =====
@@ -85,7 +121,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 
 #ifndef STT_MAX_CAPTURE_SAMPLES
 /** Upper bound @ 16 kHz (~10 s). Long “wake + web search …” prompts need ≥8–15 s spoken;
- * raise via build flag if you have heap (~320 KiB PCM here); Worker + xAI STT accept long clips. */
+ * raise via build flag if you have heap (~320 KiB PCM here); Worker + Sarvam allow ~30 s via STT limits. */
 #define STT_MAX_CAPTURE_SAMPLES 160000
 #endif
 #ifndef STT_MIN_CAPTURE_SAMPLES
@@ -175,8 +211,12 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
  * Stream mode (1): jitter ring — still one continuous utterance, not “packet speech”. */
 
 #ifndef PCM_NORMALIZE_PEAK_TARGET
-/** Peak-normalize clip to this before boost / I2S (32767 = max int16). */
-#define PCM_NORMALIZE_PEAK_TARGET 32767
+/** Peak-normalize before boost / gain (~85% scale headroom); soft limiting handles hotter peaks downstream. */
+#define PCM_NORMALIZE_PEAK_TARGET 28000
+#endif
+#ifndef PCM_SOFT_LIMIT_THRESHOLD
+/** Above +/- this magnitude, squash toward +-32767 (ratio curve) instead of hard clip. */
+#define PCM_SOFT_LIMIT_THRESHOLD 30000
 #endif
 #ifndef PCM_NORMALIZE_NOISE_FLOOR
 /** Below this abs peak in clip, skip normalization (quiet TTS still scales if above floor). */
@@ -185,15 +225,15 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 
 /** Extra digital push after normalize (buffered mode): lifts RMS; peaks clip — louder but hotter. */
 #ifndef PCM_SATURATE_BOOST_PERCENT
-#define PCM_SATURATE_BOOST_PERCENT 132
+#define PCM_SATURATE_BOOST_PERCENT 120
 #endif
 
 /** I2S write gain: buffered path uses lower value because saturate boost already ran. */
 #ifndef BUFFERED_PLAYBACK_GAIN_PERCENT
-#define BUFFERED_PLAYBACK_GAIN_PERCENT 118
+#define BUFFERED_PLAYBACK_GAIN_PERCENT 140
 #endif
 #ifndef STREAM_PLAYBACK_GAIN_PERCENT
-#define STREAM_PLAYBACK_GAIN_PERCENT 680
+#define STREAM_PLAYBACK_GAIN_PERCENT 220
 #endif
 
 static unsigned g_pcmWriteGainPct = STREAM_PLAYBACK_GAIN_PERCENT;
@@ -468,7 +508,7 @@ static int peakAbsChunk(const int16_t* buf, int samples) {
   return peak;
 }
 
-// ================= STT: one /transcribe per VAD utterance (Worker → xAI) =================
+// ================= STT: one /transcribe per VAD utterance (Worker → Sarvam) =================
 // PCM → text always needs speech recognition. This firmware does not run a second STT for “wake”
 // vs “command” — there is a single POST with the whole clip. Wake checks are string rules on that
 // transcript (no second STT for “wake” vs “command”). To avoid paying STT on random room noise, use
@@ -598,10 +638,25 @@ static bool transcriptContainsWakeWord(const String& transcript) {
   if (t.length() == 0)
     return false;
 
-  if (t.indexOf(String(OPEN_EVE_WAKE_WORD_HI_UTF8)) >= 0)
-    return true;
-  if (t.indexOf(String(OPEN_EVE_WAKE_WORD_HI_ALT_UTF8)) >= 0)
-    return true;
+  static const char* const kUtf8Wakes[] = {
+    OPEN_EVE_WAKE_WORD_HI_UTF8,
+    OPEN_EVE_WAKE_WORD_HI_ALT_UTF8,
+    OPEN_EVE_WAKE_WORD_OD_UTF8,
+    OPEN_EVE_WAKE_WORD_OD_ALT_UTF8,
+    OPEN_EVE_WAKE_WORD_BN_UTF8,
+    OPEN_EVE_WAKE_WORD_TE_UTF8,
+    OPEN_EVE_WAKE_WORD_KN_UTF8,
+    OPEN_EVE_WAKE_WORD_ML_UTF8,
+    OPEN_EVE_WAKE_WORD_TA_UTF8,
+    OPEN_EVE_WAKE_WORD_GU_UTF8,
+    OPEN_EVE_WAKE_WORD_PA_UTF8,
+    nullptr,
+  };
+
+  for (int i = 0; kUtf8Wakes[i] != nullptr; i++) {
+    if (strlen(kUtf8Wakes[i]) && t.indexOf(String(kUtf8Wakes[i])) >= 0)
+      return true;
+  }
 
   String lo = t;
   lo.toLowerCase();
@@ -612,7 +667,7 @@ static bool transcriptContainsWakeWord(const String& transcript) {
   return latinWakeWordPresent(lo, wake);
 }
 
-/** True only when the utterance is just the wake token (Latin or Hindi), optional ASCII punctuation. */
+/** True only when the utterance is just the wake token (Latin or Indic spellings below), optional ASCII punctuation. */
 static bool utteranceIsWakeOnly(const String& transcript) {
   String s = transcript;
   s.trim();
@@ -627,10 +682,27 @@ static bool utteranceIsWakeOnly(const String& transcript) {
 
   String hi = s;
   stripAsciiEdges(hi);
-  if (hi.length() && hi == String(OPEN_EVE_WAKE_WORD_HI_UTF8))
-    return true;
-  if (hi.length() && hi == String(OPEN_EVE_WAKE_WORD_HI_ALT_UTF8))
-    return true;
+
+  static const char* const kWakeOnlyUtf8[] = {
+    OPEN_EVE_WAKE_WORD_HI_UTF8,
+    OPEN_EVE_WAKE_WORD_HI_ALT_UTF8,
+    OPEN_EVE_WAKE_WORD_OD_UTF8,
+    OPEN_EVE_WAKE_WORD_OD_ALT_UTF8,
+    OPEN_EVE_WAKE_WORD_BN_UTF8,
+    OPEN_EVE_WAKE_WORD_TE_UTF8,
+    OPEN_EVE_WAKE_WORD_KN_UTF8,
+    OPEN_EVE_WAKE_WORD_ML_UTF8,
+    OPEN_EVE_WAKE_WORD_TA_UTF8,
+    OPEN_EVE_WAKE_WORD_GU_UTF8,
+    OPEN_EVE_WAKE_WORD_PA_UTF8,
+    nullptr,
+  };
+  if (hi.length()) {
+    for (int i = 0; kWakeOnlyUtf8[i] != nullptr; i++) {
+      if (!strlen(kWakeOnlyUtf8[i])) continue;
+      if (hi == String(kWakeOnlyUtf8[i])) return true;
+    }
+  }
 
   return false;
 }
@@ -776,11 +848,34 @@ static int32_t pcmS16PeakAbs(const int16_t* s, size_t nSamp) {
   return peak;
 }
 
+/** Symmetric soft clip: |x| > threshold → smooth toward ±32767 (no hard edge at threshold). */
+static int16_t pcmSoftLimitInt64ToS16(int64_t x) {
+  const int32_t T = PCM_SOFT_LIMIT_THRESHOLD;
+  const int32_t R = 32767 - T;
+  if (x > T) {
+    int64_t over = x - T;
+    if (over < 0) over = 0;
+    int64_t y = T + (over * R) / (R + over);
+    if (y > 32767) y = 32767;
+    return (int16_t)y;
+  }
+  if (x < -T) {
+    int64_t over = -T - x;
+    if (over < 0) over = 0;
+    int64_t y = -T - (over * R) / (R + over);
+    if (y < -32768) y = -32768;
+    return (int16_t)y;
+  }
+  if (x > 32767) return 32767;
+  if (x < -32768) return -32768;
+  return (int16_t)x;
+}
+
 /**
- * Scale buffered PCM so the loudest sample hits PCM_NORMALIZE_PEAK_TARGET (max headroom use).
- * Modifies samples in place; call once on the full clip before playback.
+ * Peak-normalize to PCM_NORMALIZE_PEAK_TARGET (~28000), then soft-limit instead of hard clamp.
+ * Call once on the full clip before playback.
  */
-static void normalizePcmS16FullScale(int16_t* s, size_t nSamp) {
+static void normalizePcmS16SoftLimited(int16_t* s, size_t nSamp) {
   if (nSamp == 0) return;
   int32_t peak = pcmS16PeakAbs(s, nSamp);
   if (peak < (int32_t)PCM_NORMALIZE_NOISE_FLOOR) {
@@ -791,14 +886,10 @@ static void normalizePcmS16FullScale(int16_t* s, size_t nSamp) {
       ((int64_t)PCM_NORMALIZE_PEAK_TARGET * 65536LL) / (int64_t)peak;
   for (size_t i = 0; i < nSamp; i++) {
     int64_t x = ((int64_t)s[i] * scaleQ16) >> 16;
-    if (x > 32767)
-      x = 32767;
-    else if (x < -32768)
-      x = -32768;
-    s[i] = (int16_t)x;
+    s[i] = pcmSoftLimitInt64ToS16(x);
   }
-  Serial.printf("[PCM] normalized abs_peak=%ld → target=%d (single pass playback)\n",
-                (long)peak, PCM_NORMALIZE_PEAK_TARGET);
+  Serial.printf("[PCM] soft-normalize abs_peak=%ld → target=%d (limit @ ±%d)\n",
+                (long)peak, PCM_NORMALIZE_PEAK_TARGET, PCM_SOFT_LIMIT_THRESHOLD);
 }
 
 static void pcmSaturateBoostInPlace(int16_t* s, size_t nSamp, unsigned pct) {
@@ -806,15 +897,11 @@ static void pcmSaturateBoostInPlace(int16_t* s, size_t nSamp, unsigned pct) {
     return;
   for (size_t i = 0; i < nSamp; i++) {
     int64_t x = ((int64_t)s[i] * (int64_t)pct) / 100;
-    if (x > 32767)
-      x = 32767;
-    else if (x < -32768)
-      x = -32768;
-    s[i] = (int16_t)x;
+    s[i] = pcmSoftLimitInt64ToS16(x);
   }
 }
 
-/** Drain entire PCM buffer to I2S in slices — never truncate after txSlots samples. */
+/** Drain PCM to I2S @ SAMPLE_RATE_OUT (24 kHz, match Worker TTS). Gain in int64, soft-limit, assign to slots. */
 static void writePcmBytesToI2s(uint8_t* buf, size_t len, bool* checkedWav) {
   if (len & 1) len--;
 
@@ -831,13 +918,9 @@ static void writePcmBytesToI2s(uint8_t* buf, size_t len, bool* checkedWav) {
 
     const int16_t* ps = (const int16_t*)buf;
     for (size_t i = 0; i < chunkSamples; i++) {
-      int64_t g =
-          ((int64_t)ps[i] * (int64_t)g_pcmWriteGainPct) / 100;
-      if (g > 32767)
-        g = 32767;
-      else if (g < -32768)
-        g = -32768;
-      txSlots[i] = ((int32_t)g) << 16;
+      int64_t g = ((int64_t)ps[i] * (int64_t)g_pcmWriteGainPct) / 100;
+      int16_t out = pcmSoftLimitInt64ToS16(g);
+      txSlots[i] = ((int32_t)out) << 16;
     }
 
     size_t written = 0;
@@ -942,7 +1025,7 @@ static size_t playBufferedPcmAndSilence() {
 
   i2s_zero_dma_buffer(I2S_NUM_1);
   if (playLen >= 2) {
-    normalizePcmS16FullScale((int16_t*)playPtr, playLen / 2);
+    normalizePcmS16SoftLimited((int16_t*)playPtr, playLen / 2);
     pcmSaturateBoostInPlace((int16_t*)playPtr, playLen / 2, PCM_SATURATE_BOOST_PERCENT);
   }
 
@@ -1444,7 +1527,7 @@ void loop() {
 #elif OPEN_EVE_REQUIRE_WAKE_WORD
       if (!gWakeCommandArmed) {
         if (!transcriptContainsWakeWord(transcript)) {
-          Serial.println("[WAKE] ignored — include eve / Hindi wake name in your sentence");
+          Serial.println("[WAKE] ignored — say \"eve\" (English) or your language’s spelling of Eve (Odia ଇଭ୍, Hindi इव…)");
           vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
         } else if (utteranceIsWakeOnly(transcript)) {
           gWakeCommandArmed = true;
