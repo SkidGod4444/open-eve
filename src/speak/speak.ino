@@ -4,6 +4,7 @@
 #include <driver/i2s.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 // ================= CONFIG =================
 const char* WIFI_SSID = "GALGOTIAS-ARUBA";
@@ -40,29 +41,44 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define VAD_PEAK_THRESHOLD 2800
 #endif
 
-#ifndef PCM_JITTER_BYTES
-#define PCM_JITTER_BYTES 32768
-#endif
-#ifndef PCM_PREFILL_BYTES
-#define PCM_PREFILL_BYTES 8192
-#endif
-#ifndef PCM_DRAIN_BLOCK_BYTES
-#define PCM_DRAIN_BLOCK_BYTES 4096
+/** Max PCM body size to buffer before playback (then play once — avoids stream underruns). */
+#ifndef CHAT_PCM_MAX_BYTES
+#define CHAT_PCM_MAX_BYTES (640 * 1024)
 #endif
 
 // Mic picks up speaker → false VAD; stay deaf for (audio length + pad).
 #ifndef VAD_AFTER_PLAY_PADDING_MS
-#define VAD_AFTER_PLAY_PADDING_MS 4000
+#define VAD_AFTER_PLAY_PADDING_MS 6500
 #endif
 #ifndef VAD_COOLDOWN_EMPTY_MS
-#define VAD_COOLDOWN_EMPTY_MS 1500
+#define VAD_COOLDOWN_EMPTY_MS 1800
 #endif
 #ifndef VAD_COOLDOWN_MIN_MS
-#define VAD_COOLDOWN_MIN_MS 3500
+#define VAD_COOLDOWN_MIN_MS 5200
 #endif
 
+/** Full-buffer playback only: entire HTTP body is accumulated, then ONE I2S pass (no chunk-by-chunk speech). */
+
+#ifndef PCM_NORMALIZE_PEAK_TARGET
+/** Loudest clean int16 peak before optional PLAYBACK_GAIN_PERCENT (32767 = absolute max). */
+#define PCM_NORMALIZE_PEAK_TARGET 32767
+#endif
+#ifndef PCM_NORMALIZE_NOISE_FLOOR
+/** Below this peak abs sample, skip normalization (avoid blasting hiss). */
+#define PCM_NORMALIZE_NOISE_FLOOR 48
+#endif
+
+/** Applied after peak-normalize (100 = unity). Use >100 only if you accept clipping (“overdrive”). */
 #ifndef PLAYBACK_GAIN_PERCENT
-#define PLAYBACK_GAIN_PERCENT 320
+#define PLAYBACK_GAIN_PERCENT 100
+#endif
+
+// Must match setupI2SSpeaker() — used to flush real silence through TX DMA (stops last-sample “stuck”).
+#ifndef I2S_SPEAKER_DMA_BUF_COUNT
+#define I2S_SPEAKER_DMA_BUF_COUNT 24
+#endif
+#ifndef I2S_SPEAKER_DMA_BUF_LEN
+#define I2S_SPEAKER_DMA_BUF_LEN 512
 #endif
 
 int32_t rawBuffer[BUFFER_SIZE];
@@ -104,8 +120,8 @@ void setupI2SSpeaker() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 24,
-    .dma_buf_len = 512
+    .dma_buf_count = I2S_SPEAKER_DMA_BUF_COUNT,
+    .dma_buf_len = I2S_SPEAKER_DMA_BUF_LEN
   };
 
   i2s_pin_config_t pins = {
@@ -258,13 +274,116 @@ static String deviceIdFromMac() {
   return String(id);
 }
 
-// ----- Playback jitter buffer + slice I2S writes (txSlots size cap) -----
+// ----- PCM accumulation (/chat body) then single playback pass -----
 
-static uint8_t pcmJb[PCM_JITTER_BYTES];
-static size_t pcmJbLen = 0;
+static uint8_t* g_pcmAccum = nullptr;
+static size_t g_pcmAccumCap = 0;
+static size_t g_pcmAccumLen = 0;
 
-static void pcmJbReset() {
-  pcmJbLen = 0;
+static void pcmAccumClear() {
+  free(g_pcmAccum);
+  g_pcmAccum = nullptr;
+  g_pcmAccumCap = 0;
+  g_pcmAccumLen = 0;
+}
+
+static bool pcmAccumReserve(size_t goal) {
+  if (goal > CHAT_PCM_MAX_BYTES)
+    goal = CHAT_PCM_MAX_BYTES;
+  if (goal <= g_pcmAccumCap)
+    return true;
+  uint8_t* p = (uint8_t*)realloc(g_pcmAccum, goal);
+  if (!p)
+    return false;
+  g_pcmAccum = p;
+  g_pcmAccumCap = goal;
+  return true;
+}
+
+/** Append decoded PCM chunk to heap buffer; false if over limit or realloc fails. */
+static bool pcmAccumAppend(const uint8_t* src, size_t n) {
+  if (n == 0)
+    return true;
+  if (g_pcmAccumLen > CHAT_PCM_MAX_BYTES - n)
+    return false;
+  size_t need = g_pcmAccumLen + n;
+  if (need > g_pcmAccumCap) {
+    size_t cap = g_pcmAccumCap ? g_pcmAccumCap : 8192;
+    while (cap < need && cap < CHAT_PCM_MAX_BYTES)
+      cap *= 2;
+    if (cap < need)
+      cap = need;
+    if (cap > CHAT_PCM_MAX_BYTES)
+      cap = CHAT_PCM_MAX_BYTES;
+    uint8_t* p = (uint8_t*)realloc(g_pcmAccum, cap);
+    if (!p)
+      return false;
+    g_pcmAccum = p;
+    g_pcmAccumCap = cap;
+  }
+  memcpy(g_pcmAccum + g_pcmAccumLen, src, n);
+  g_pcmAccumLen += n;
+  return true;
+}
+
+static uint32_t readU32le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
+/** Byte offset of PCM samples if body is WAV; 0 if raw PCM. */
+static size_t pcmWavDataOffset(const uint8_t* d, size_t len) {
+  if (len < 36 || memcmp(d, "RIFF", 4) != 0 || memcmp(d + 8, "WAVE", 4) != 0)
+    return 0;
+  size_t pos = 12;
+  while (pos + 8 <= len) {
+    uint32_t chunkSize = readU32le(d + pos + 4);
+    if (memcmp(d + pos, "data", 4) == 0)
+      return pos + 8;
+    size_t next = pos + 8 + (size_t)chunkSize;
+    if (chunkSize & 1)
+      next++;
+    if (next < pos + 8 || next > len)
+      break;
+    pos = next;
+  }
+  return 0;
+}
+
+/** Peak absolute sample in s[0..n). */
+static int32_t pcmS16PeakAbs(const int16_t* s, size_t nSamp) {
+  int32_t peak = 0;
+  for (size_t i = 0; i < nSamp; i++) {
+    int32_t v = (int32_t)s[i];
+    if (v < 0) v = -v;
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
+/**
+ * Scale buffered PCM so the loudest sample hits PCM_NORMALIZE_PEAK_TARGET (max headroom use).
+ * Modifies samples in place; call once on the full clip before playback.
+ */
+static void normalizePcmS16FullScale(int16_t* s, size_t nSamp) {
+  if (nSamp == 0) return;
+  int32_t peak = pcmS16PeakAbs(s, nSamp);
+  if (peak < (int32_t)PCM_NORMALIZE_NOISE_FLOOR) {
+    Serial.println("[PCM] normalize skipped (near silence)");
+    return;
+  }
+  int64_t scaleQ16 =
+      ((int64_t)PCM_NORMALIZE_PEAK_TARGET * 65536LL) / (int64_t)peak;
+  for (size_t i = 0; i < nSamp; i++) {
+    int64_t x = ((int64_t)s[i] * scaleQ16) >> 16;
+    if (x > 32767)
+      x = 32767;
+    else if (x < -32768)
+      x = -32768;
+    s[i] = (int16_t)x;
+  }
+  Serial.printf("[PCM] normalized abs_peak=%ld → target=%d (single pass playback)\n",
+                (long)peak, PCM_NORMALIZE_PEAK_TARGET);
 }
 
 /** Drain entire PCM buffer to I2S in slices — never truncate after txSlots samples. */
@@ -284,53 +403,70 @@ static void writePcmBytesToI2s(uint8_t* buf, size_t len, bool* checkedWav) {
 
     const int16_t* ps = (const int16_t*)buf;
     for (size_t i = 0; i < chunkSamples; i++) {
-      int32_t g = ((int32_t)ps[i] * (int32_t)PLAYBACK_GAIN_PERCENT) / 100;
-      if (g > 32767) g = 32767;
-      if (g < -32768) g = -32768;
-      txSlots[i] = g << 16;
+      int64_t g =
+          ((int64_t)ps[i] * (int64_t)PLAYBACK_GAIN_PERCENT) / 100;
+      if (g > 32767)
+        g = 32767;
+      else if (g < -32768)
+        g = -32768;
+      txSlots[i] = ((int32_t)g) << 16;
     }
 
     size_t written = 0;
     i2s_write(I2S_NUM_1, txSlots, chunkSamples * sizeof(int32_t), &written, portMAX_DELAY);
+    yield();
 
     buf += chunkSamples * 2;
     len -= chunkSamples * 2;
   }
 }
 
-static void pcmJbDrain(bool* checkedWav, bool flushAll) {
-  if (!flushAll && pcmJbLen < PCM_PREFILL_BYTES)
-    return;
-
-  while (pcmJbLen >= PCM_DRAIN_BLOCK_BYTES || (flushAll && pcmJbLen >= 2)) {
-    size_t take =
-        (pcmJbLen >= PCM_DRAIN_BLOCK_BYTES) ? PCM_DRAIN_BLOCK_BYTES : (pcmJbLen & ~(size_t)1);
-    if (take < 2) break;
-    writePcmBytesToI2s(pcmJb, take, checkedWav);
-    memmove(pcmJb, pcmJb + take, pcmJbLen - take);
-    pcmJbLen -= take;
+/** Push zeros through I2S TX until DMA ring is flushed — avoids repeating last PCM forever. */
+static void silenceSpeakerTail() {
+  memset(txSlots, 0, BUFFER_SIZE * sizeof(int32_t));
+  unsigned dmaSamples =
+      (unsigned)(I2S_SPEAKER_DMA_BUF_COUNT * I2S_SPEAKER_DMA_BUF_LEN);
+  unsigned chunks =
+      (dmaSamples + (unsigned)BUFFER_SIZE - 1) / (unsigned)BUFFER_SIZE + 6;
+  for (unsigned i = 0; i < chunks; i++) {
+    size_t written = 0;
+    i2s_write(I2S_NUM_1, txSlots, BUFFER_SIZE * sizeof(int32_t), &written,
+               portMAX_DELAY);
   }
+  i2s_zero_dma_buffer(I2S_NUM_1);
 }
 
-static void pcmJbPush(const uint8_t* data, size_t n, bool* checkedWav) {
-  while (n > 0) {
-    size_t space = sizeof(pcmJb) - pcmJbLen;
-    if (space == 0) {
-      pcmJbDrain(checkedWav, true);
-      space = sizeof(pcmJb) - pcmJbLen;
-      if (space == 0) break;
-    }
-    size_t cpy = n < space ? n : space;
-    memcpy(pcmJb + pcmJbLen, data, cpy);
-    pcmJbLen += cpy;
-    data += cpy;
-    n -= cpy;
-    pcmJbDrain(checkedWav, false);
-  }
-}
+/** One contiguous playback pass + DMA silence tail; frees accumulator. */
+static size_t playBufferedPcmAndSilence() {
+  bool checkedWav = false;
+  size_t playLen = 0;
+  uint8_t* playPtr = nullptr;
 
-static void pcmJbFlush(bool* checkedWav) {
-  pcmJbDrain(checkedWav, true);
+  if (g_pcmAccumLen == 0 || !g_pcmAccum) {
+    silenceSpeakerTail();
+    pcmAccumClear();
+    return 0;
+  }
+
+  size_t off = pcmWavDataOffset(g_pcmAccum, g_pcmAccumLen);
+  if (off > 0)
+    Serial.printf("[PCM] WAV container, data @ %u\n", (unsigned)off);
+
+  playPtr = g_pcmAccum + off;
+  playLen = g_pcmAccumLen > off ? g_pcmAccumLen - off : 0;
+  playLen &= ~(size_t)1;
+
+  Serial.printf("[PCM] collected %u bytes → one-shot play %u B PCM\n",
+                (unsigned)g_pcmAccumLen, (unsigned)playLen);
+
+  i2s_zero_dma_buffer(I2S_NUM_1);
+  if (playLen >= 2)
+    normalizePcmS16FullScale((int16_t*)playPtr, playLen / 2);
+
+  writePcmBytesToI2s(playPtr, playLen, &checkedWav);
+  silenceSpeakerTail();
+  pcmAccumClear();
+  return playLen;
 }
 
 // ----- /chat: raw TLS — ESP32 HTTPClient often leaves chunked PCM unreadable -----
@@ -429,7 +565,7 @@ static bool readResponseHeaders(WiFiClientSecure& c, String& out, unsigned long 
   return false;
 }
 
-/** @return PCM body bytes decoded to speaker, 0 if no audio played */
+/** @return Int16 PCM bytes played (even length, after WAV strip), 0 if none */
 size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   String escaped;
   jsonEscapeInto(escaped, transcript.c_str());
@@ -497,16 +633,20 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   long contentLen = parseContentLengthHdr(headers);
   Serial.printf("[AI] chunked=%d content-length=%ld\n", chunked ? 1 : 0, contentLen);
 
-  i2s_zero_dma_buffer(I2S_NUM_1);
-  pcmJbReset();
+  pcmAccumClear();
+  if (!chunked && contentLen > 0 &&
+      (unsigned long)contentLen <= (unsigned long)CHAT_PCM_MAX_BYTES)
+    pcmAccumReserve((size_t)contentLen);
 
   uint8_t buf[1024];
-  bool checkedWav = false;
-  size_t totalBytes = 0;
+  size_t totalRx = 0;
+  bool accumFull = false;
   unsigned long pcmDeadline = millis() + CHAT_HTTP_TIMEOUT_MS;
 
   if (chunked) {
     for (;;) {
+      if (accumFull)
+        break;
       char lineBuf[96];
       if (!readLineCrLf(client, lineBuf, sizeof(lineBuf), pcmDeadline)) {
         Serial.println("[PCM] chunk-size line timeout");
@@ -534,15 +674,30 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         size_t take = chunkSz > sizeof(buf) ? sizeof(buf) : (size_t)chunkSz;
         if (!readExact(client, buf, take, pcmDeadline)) {
           Serial.println("[PCM] short chunk read");
-          pcmJbFlush(&checkedWav);
           client.stop();
-          Serial.printf("[AUDIO DONE] %u bytes\n", (unsigned)totalBytes);
-          return totalBytes;
+          size_t played = playBufferedPcmAndSilence();
+          Serial.printf("[AUDIO DONE] rx=%u played=%u (truncated)\n", (unsigned)totalRx,
+                        (unsigned)played);
+          return played;
         }
-        pcmJbPush(buf, take, &checkedWav);
-        totalBytes += take;
+        if (!pcmAccumAppend(buf, take)) {
+          Serial.println("[PCM] buffer limit — draining chunk then stopping capture");
+          accumFull = true;
+          chunkSz -= take;
+          while (chunkSz > 0) {
+            size_t dt = chunkSz > sizeof(buf) ? sizeof(buf) : chunkSz;
+            if (!readExact(client, buf, dt, pcmDeadline))
+              break;
+            chunkSz -= dt;
+          }
+          break;
+        }
+        totalRx += take;
         chunkSz -= take;
       }
+
+      if (accumFull)
+        break;
 
       uint8_t crlf[2];
       if (!readExact(client, crlf, 2, millis() + 8000)) {
@@ -551,17 +706,29 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
       }
     }
   } else if (contentLen > 0) {
-    while (contentLen > 0) {
+    while (contentLen > 0 && !accumFull) {
       size_t take = (size_t)contentLen > sizeof(buf) ? sizeof(buf) : (size_t)contentLen;
       if (!readExact(client, buf, take, pcmDeadline))
         break;
-      pcmJbPush(buf, take, &checkedWav);
-      totalBytes += take;
+      if (!pcmAccumAppend(buf, take)) {
+        Serial.println("[PCM] buffer limit");
+        accumFull = true;
+        contentLen -= (long)take;
+        while (contentLen > 0) {
+          size_t dt =
+              (size_t)contentLen > sizeof(buf) ? sizeof(buf) : (size_t)contentLen;
+          if (!readExact(client, buf, dt, pcmDeadline))
+            break;
+          contentLen -= (long)dt;
+        }
+        break;
+      }
+      totalRx += take;
       contentLen -= (long)take;
     }
   } else {
     unsigned long lastData = millis();
-    while (millis() < pcmDeadline) {
+    while (millis() < pcmDeadline && !accumFull) {
       int avail = client.available();
       if (avail > 0) {
         lastData = millis();
@@ -569,8 +736,12 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         if (want & 1) want--;
         int len = client.read(buf, want > 0 ? want : 0);
         if (len > 0) {
-          pcmJbPush(buf, (size_t)len, &checkedWav);
-          totalBytes += (size_t)len;
+          if (!pcmAccumAppend(buf, (size_t)len)) {
+            Serial.println("[PCM] buffer limit");
+            accumFull = true;
+            break;
+          }
+          totalRx += (size_t)len;
         }
         yield();
         continue;
@@ -584,11 +755,10 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
     }
   }
 
-  pcmJbFlush(&checkedWav);
-
   client.stop();
-  Serial.printf("[AUDIO DONE] %u PCM bytes\n", (unsigned)totalBytes);
-  return totalBytes;
+  size_t played = playBufferedPcmAndSilence();
+  Serial.printf("[AUDIO DONE] rx=%u played=%u PCM bytes\n", (unsigned)totalRx, (unsigned)played);
+  return played;
 }
 
 void setup() {
@@ -636,6 +806,7 @@ void loop() {
 
     if (transcript.length() > 0) {
       size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
+      pcmBytes &= ~(size_t)1;
       unsigned long audioMs =
           pcmBytes > 0 ? ((pcmBytes / 2) * 1000UL / (unsigned long)SAMPLE_RATE_OUT) : 0;
       unsigned long guard = audioMs + (unsigned long)VAD_AFTER_PLAY_PADDING_MS;
