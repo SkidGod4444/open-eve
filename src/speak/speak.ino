@@ -1,6 +1,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h>
 #include <driver/i2s.h>
 #include <math.h>
 #include <stdlib.h>
@@ -10,6 +13,22 @@
 const char* WIFI_SSID = "GALGOTIAS-ARUBA";
 const char* WIFI_PASS = "1234567@";
 static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
+
+/** NVS namespace for saved STA credentials (portal writes ssid + pass). */
+#ifndef OPEN_EVE_PREFS_NS
+#define OPEN_EVE_PREFS_NS "openeve"
+#endif
+#ifndef OPEN_EVE_WIFI_STA_TIMEOUT_MS
+#define OPEN_EVE_WIFI_STA_TIMEOUT_MS 45000UL
+#endif
+/** SoftAP name prefix; last two MAC hex digits are appended (e.g. OpenEve-A1B2). */
+#ifndef OPEN_EVE_AP_SSID_PREFIX
+#define OPEN_EVE_AP_SSID_PREFIX "OpenEveBySaidevDhal-"
+#endif
+/** WPA2 passphrase for the setup hotspot (min 8 chars). Change before shipping. */
+#ifndef OPEN_EVE_AP_PASS
+#define OPEN_EVE_AP_PASS "Gu@OpenEve"
+#endif
 
 /** Set to 0 to restore always-listening (every utterance goes to /chat). */
 #ifndef OPEN_EVE_REQUIRE_WAKE_WORD
@@ -65,16 +84,18 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #endif
 
 #ifndef STT_MAX_CAPTURE_SAMPLES
-/** Upper bound @ 16 kHz (~3.5 s). Keeps malloc size sane on ESP32-S3 with WiFi+TLS. */
-#define STT_MAX_CAPTURE_SAMPLES 56000
+/** Upper bound @ 16 kHz (~10 s). Long “wake + web search …” prompts need ≥8–15 s spoken;
+ * raise via build flag if you have heap (~320 KiB PCM here); Sarvam allows ~30 s uploads via Worker. */
+#define STT_MAX_CAPTURE_SAMPLES 160000
 #endif
 #ifndef STT_MIN_CAPTURE_SAMPLES
 /** Require at least this much audio before silence can end capture (avoid cutting first word). */
 #define STT_MIN_CAPTURE_SAMPLES 14000
 #endif
 #ifndef STT_END_SILENCE_MS
-/** Stop recording after this many ms below STT_END_SILENCE_PEAK (end of utterance). */
-#define STT_END_SILENCE_MS 850
+/** Stop recording after this many ms below STT_END_SILENCE_PEAK (end of utterance).
+ * Long commands often have brief pauses — too low cuts off before the user finishes. */
+#define STT_END_SILENCE_MS 1300
 #endif
 #ifndef STT_END_SILENCE_PEAK
 /** Chunk peak below this counts as silence for endpoint (tune vs room noise). */
@@ -90,7 +111,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define CHAT_HTTP_TIMEOUT_MS 180000
 #endif
 #ifndef STT_HTTP_TIMEOUT_MS
-#define STT_HTTP_TIMEOUT_MS 60000
+#define STT_HTTP_TIMEOUT_MS 90000
 #endif
 
 #ifndef PCM_STREAM_STALL_MS
@@ -101,9 +122,12 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define VAD_PEAK_THRESHOLD 1900
 #endif
 
-/** Max PCM body for /chat buffered mode — heap; lower if Worker TLS fails OOM on S3. */
+/** Max PCM body for /chat buffered mode (CHAT_PCM_PLAY_MODE 0): entire reply held in heap before play.
+ * 448 KiB ≈ 9.4 s @ 24 kHz mono — long list/news TTS hits this and truncates (“buffer limit”).
+ * Stream mode (CHAT_PCM_PLAY_MODE 1) plays while downloading — uses PCM_JITTER_BYTES instead for peak RAM.
+ * Lower if TLS/chat fails OOM; raise if you have RAM (PSRAM) and need longer one-shot replies. */
 #ifndef CHAT_PCM_MAX_BYTES
-#define CHAT_PCM_MAX_BYTES (448 * 1024)
+#define CHAT_PCM_MAX_BYTES (896 * 1024)
 #endif
 
 /**
@@ -257,16 +281,168 @@ void setupI2SSpeaker() {
   Serial.println("[I2S SPEAKER] ready (24000 Hz — match Worker x-pcm-sample-rate)");
 }
 
-void connectWiFi() {
+static WebServer* gProvServer = nullptr;
+static DNSServer gDnsServer;
+
+static void loadWifiCredentials(String& ssid, String& pass) {
+  Preferences prefs;
+  if (prefs.begin(OPEN_EVE_PREFS_NS, true)) {
+    ssid = prefs.getString("ssid", "");
+    pass = prefs.getString("pass", "");
+    prefs.end();
+  } else {
+    ssid = "";
+    pass = "";
+  }
+  if (ssid.length() == 0) {
+    ssid = WIFI_SSID;
+    pass = WIFI_PASS;
+  }
+}
+
+static bool connectWiFiSta(const String& ssid, const String& pass) {
+  if (ssid.length() == 0) {
+    Serial.println("[WiFi] no SSID (use provisioning portal)");
+    return false;
+  }
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WiFi] connecting");
-  while (WiFi.status() != WL_CONNECTED) {
+  WiFi.disconnect(true, true);
+  delay(200);
+
+  if (pass.length() > 0)
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  else
+    WiFi.begin(ssid.c_str());
+
+  Serial.printf("[WiFi] STA connecting to \"%s\"…\n", ssid.c_str());
+  Serial.print("[WiFi]");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - t0 < OPEN_EVE_WIFI_STA_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
     yield();
   }
-  Serial.println("\n[WiFi] connected");
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] STA failed or timed out");
+    WiFi.disconnect(true);
+    delay(100);
+    return false;
+  }
+
+  WiFi.setSleep(false);
+  Serial.print("[WiFi] connected, IP ");
+  Serial.println(WiFi.localIP());
+  return true;
+}
+
+static void handleProvRoot() {
+  if (!gProvServer)
+    return;
+  static const char html[] =
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" "
+      "content=\"width=device-width\"><title>Open EvE WiFi</title></head><body>"
+      "<h1>WiFi setup</h1>"
+      "<p>Join this device’s hotspot, then enter your 2.4&nbsp;GHz network.</p>"
+      "<form method=\"POST\" action=\"/save\">"
+      "<p><label>SSID<br><input name=\"ssid\" maxlength=\"32\" required "
+      "autocomplete=\"off\"></label></p>"
+      "<p><label>Password<br><input name=\"pass\" type=\"password\" maxlength=\"64\" "
+      "autocomplete=\"off\"></label></p>"
+      "<p><button type=\"submit\">Save &amp; reboot</button></p>"
+      "</form></body></html>";
+  gProvServer->send(200, "text/html", html);
+}
+
+static void handleProvSave() {
+  if (!gProvServer)
+    return;
+  if (!gProvServer->hasArg("ssid")) {
+    gProvServer->send(400, "text/plain", "missing ssid");
+    return;
+  }
+
+  String ssid = gProvServer->arg("ssid");
+  String pw = gProvServer->hasArg("pass") ? gProvServer->arg("pass") : "";
+  ssid.trim();
+  pw.trim();
+
+  if (ssid.length() == 0 || ssid.length() > 32) {
+    gProvServer->send(400, "text/plain", "invalid ssid");
+    return;
+  }
+  if (pw.length() > 64) {
+    gProvServer->send(400, "text/plain", "invalid password length");
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(OPEN_EVE_PREFS_NS, false)) {
+    gProvServer->send(500, "text/plain", "storage error");
+    return;
+  }
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pw);
+  prefs.end();
+
+  Serial.printf("[WiFi] saved SSID \"%s\" — rebooting\n", ssid.c_str());
+  gProvServer->send(200, "text/html",
+                     "<!DOCTYPE html><html><body><p>Saved. Rebooting…</p></body></html>");
+  delay(400);
+  ESP.restart();
+}
+
+/** Blocks until credentials submitted or device reset; never returns except via ESP.restart(). */
+static void runWifiProvisioningPortal() {
+  WiFi.disconnect(true, true);
+  delay(200);
+  WiFi.mode(WIFI_AP);
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char apName[33];
+  snprintf(apName, sizeof(apName), "%s%02X%02X", OPEN_EVE_AP_SSID_PREFIX, mac[4], mac[5]);
+
+  if (!WiFi.softAP(apName, OPEN_EVE_AP_PASS)) {
+    Serial.println("[WiFi] softAP failed — fix OPEN_EVE_AP_SSID_PREFIX / channel");
+    while (true) {
+      delay(1000);
+      yield();
+    }
+  }
+
+  IPAddress apIp = WiFi.softAPIP();
+  Serial.printf("[WiFi] SoftAP \"%s\" — use WPA2 password from OPEN_EVE_AP_PASS in sketch\n",
+                apName);
+  Serial.printf("[WiFi] Captive portal / setup: http://%s/\n", apIp.toString().c_str());
+
+  gDnsServer.stop();
+  gDnsServer.start(53, "*", apIp);
+
+  static WebServer server(80);
+  gProvServer = &server;
+
+  server.on("/", HTTP_GET, handleProvRoot);
+  server.on("/save", HTTP_POST, handleProvSave);
+  server.onNotFound([]() {
+    if (!gProvServer)
+      return;
+    gProvServer->sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/",
+                             true);
+    gProvServer->send(302, "text/plain", "");
+  });
+
+  server.begin();
+
+  while (true) {
+    gDnsServer.processNextRequest();
+    server.handleClient();
+    delay(2);
+    yield();
+  }
 }
 
 void readMic(int16_t* out, int samples) {
@@ -1009,7 +1185,8 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         if (streamPlay)
           pcmJbPush(buf, take, &checkedWav);
         else if (!pcmAccumAppend(buf, take)) {
-          Serial.println("[PCM] buffer limit — draining chunk then stopping capture");
+          Serial.println("[PCM] buffer limit — draining chunk then stopping capture "
+                         "(raise CHAT_PCM_MAX_BYTES or CHAT_PCM_PLAY_MODE 1)");
           accumFull = true;
           chunkSz -= take;
           while (chunkSz > 0) {
@@ -1041,7 +1218,7 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
       if (streamPlay)
         pcmJbPush(buf, take, &checkedWav);
       else if (!pcmAccumAppend(buf, take)) {
-        Serial.println("[PCM] buffer limit");
+        Serial.println("[PCM] buffer limit (raise CHAT_PCM_MAX_BYTES or CHAT_PCM_PLAY_MODE 1)");
         accumFull = true;
         contentLen -= (long)take;
         while (contentLen > 0) {
@@ -1069,7 +1246,7 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
           if (streamPlay)
             pcmJbPush(buf, (size_t)len, &checkedWav);
           else if (!pcmAccumAppend(buf, (size_t)len)) {
-            Serial.println("[PCM] buffer limit");
+            Serial.println("[PCM] buffer limit (raise CHAT_PCM_MAX_BYTES or CHAT_PCM_PLAY_MODE 1)");
             accumFull = true;
             break;
           }
@@ -1123,7 +1300,15 @@ void setup() {
   delay(1000);
   Serial.println("[BOOT]");
   Serial.printf("[BOOT] heap=%u\n", (unsigned)ESP.getFreeHeap());
-  connectWiFi();
+
+  String wifiSsid;
+  String wifiPass;
+  loadWifiCredentials(wifiSsid, wifiPass);
+  if (!connectWiFiSta(wifiSsid, wifiPass)) {
+    Serial.println("[WiFi] starting provisioning portal (STA unavailable)");
+    runWifiProvisioningPortal();
+  }
+
   Serial.printf("[BOOT] heap after WiFi=%u\n", (unsigned)ESP.getFreeHeap());
   if (!allocSttCaptureBuffer()) {
     Serial.println("[HALT] Out of RAM for voice capture buffer");
@@ -1219,6 +1404,12 @@ void loop() {
       if (totalWritten >= (size_t)STT_MIN_CAPTURE_SAMPLES &&
           silentRunSamples >= silentNeedSamples)
         break;
+    }
+
+    if (totalWritten >= (size_t)STT_MAX_CAPTURE_SAMPLES &&
+        silentRunSamples < silentNeedSamples) {
+      Serial.println("[STT] WARN: capture hit STT_MAX_CAPTURE_SAMPLES before silence — phrase may be "
+                     "truncated; increase STT_MAX_CAPTURE_SAMPLES if you have heap");
     }
 
     Serial.printf("[STT] captured %u samples (~%lu ms @ %u Hz)\n",
