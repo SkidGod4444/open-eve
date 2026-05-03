@@ -49,7 +49,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 /**
  * Offline wake (no HTTP while idle): active-low GPIO (button to GND). On a press edge,
  * ONE following utterance may use STT + /chat + TTS. While not armed, loud speech is ignored
- * locally (no upload, no Sarvam, no Worker).
+ * locally (no upload, no cloud STT, no Worker).
  *
  * Spoken “eve” without cloud STT is not implementable in plain C++ on the ESP32 — you need
  * on-device WakeNet / ESP_SR (ESP32-S3 + SR partition + trained model) or a third-party wake lib.
@@ -60,7 +60,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #endif
 
 #if OPEN_EVE_REQUIRE_WAKE_WORD && OPEN_EVE_HARDWARE_WAKE_GPIO < 0
-#warning Open EvE: transcript wake uses Sarvam /transcribe on every loud utterance. Set OPEN_EVE_HARDWARE_WAKE_GPIO>=0 for no cloud STT until wake button, or say wake+command in one sentence (still one STT).
+#warning Open EvE: transcript wake uses Worker /transcribe (xAI STT) on every loud utterance. Set OPEN_EVE_HARDWARE_WAKE_GPIO>=0 for no cloud STT until wake button, or say wake+command in one sentence (still one STT).
 #endif
 
 // ===== MIC (I2S0) =====
@@ -85,7 +85,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 
 #ifndef STT_MAX_CAPTURE_SAMPLES
 /** Upper bound @ 16 kHz (~10 s). Long “wake + web search …” prompts need ≥8–15 s spoken;
- * raise via build flag if you have heap (~320 KiB PCM here); Sarvam allows ~30 s uploads via Worker. */
+ * raise via build flag if you have heap (~320 KiB PCM here); Worker + xAI STT accept long clips. */
 #define STT_MAX_CAPTURE_SAMPLES 160000
 #endif
 #ifndef STT_MIN_CAPTURE_SAMPLES
@@ -468,10 +468,10 @@ static int peakAbsChunk(const int16_t* buf, int samples) {
   return peak;
 }
 
-// ================= STT: one /transcribe per VAD utterance (Sarvam) =================
+// ================= STT: one /transcribe per VAD utterance (Worker → xAI) =================
 // PCM → text always needs speech recognition. This firmware does not run a second STT for “wake”
 // vs “command” — there is a single POST with the whole clip. Wake checks are string rules on that
-// transcript (no extra Sarvam call). To avoid paying STT on random room noise, use
+// transcript (no second STT for “wake” vs “command”). To avoid paying STT on random room noise, use
 // OPEN_EVE_HARDWARE_WAKE_GPIO (no upload until armed) or on-device wake (ESP-SR / WakeNet).
 String sendSTT(int16_t* audio, int samples) {
   WiFiClientSecure tls;

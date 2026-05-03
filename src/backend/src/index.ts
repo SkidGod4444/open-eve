@@ -13,20 +13,15 @@ import { z } from 'zod'
  * Open EvE backend - voice agent for the desk robot.
  *
  * Endpoints:
- *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
- *   POST /chat        Text -> agent -> Sarvam Bulbul v3 **streaming** TTS
- *                     (`/text-to-speech/stream`) -> mono PCM s16le for ESP32
- *                     (`linear16`, default 22.05 kHz). Assistant **reply text** is also
- *                     returned as URL-encoded `x-reply-text` (truncated only if huge).
- *                     Optional `?envelope=1`: body begins with 4-byte BE JSON length +
- *                     UTF-8 `{"reply":"..."}` then raw PCM (same sample rate).
- *                     Clients that need MP3 should call
- *                     Sarvam directly; bare I2S expects PCM only.
- *                     Conversation history (last 6 turns) is kept in
- *                     Cloudflare KV per `deviceId`.
+ *   POST /transcribe  Audio -> text via xAI `/v1/stt` (response normalized to transcript + language_code).
+ *   POST /chat        Text -> agent -> TTS (conditional):
+ *                       Indian langs -> Sarvam Bulbul streaming `linear16` PCM.
+ *                       Other langs    -> xAI `/v1/tts` PCM @ 24 kHz, voice `eve`.
+ *                     Assistant reply in URL-encoded `x-reply-text`. Optional `?envelope=1`.
+ *                     KV history per `deviceId`.
  *
  * Supported request bodies on POST /transcribe:
- *   1. multipart/form-data with a `file` field (any Sarvam-supported format).
+ *   1. multipart/form-data with a `file` field (container audio).
  *   2. A binary audio file body with Content-Type audio/wav | audio/mpeg |
  *      audio/aac | audio/flac | audio/ogg.
  *   3. Raw little-endian PCM with Content-Type audio/pcm | audio/L16 |
@@ -34,19 +29,17 @@ import { z } from 'zod'
  *        sample_rate     (default 16000)
  *        channels        (default 1)
  *        bits_per_sample (default 16)
- *      The Worker wraps the PCM in a WAV header before forwarding. This is
- *      the easiest path for an ESP32 streaming I2S samples directly.
+ *      The Worker wraps the PCM in a WAV header before forwarding to xAI STT.
  *
  * Optional /transcribe query params:
- *   mode          transcribe (default) | translate | verbatim | translit | codemix
- *   language_code BCP-47 hint, e.g. hi-IN, en-IN. Required only when Sarvam
- *                 cannot auto-detect (mostly relevant for `transcribe` mode).
+ *   mode          legacy Sarvam values — accepted but ignored (xAI has no equivalent).
+ *   language_code When set: passed to xAI as `language` with `format=true` (written-form normalization).
  */
 
-const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text'
-/** Streaming endpoint (binary audio body); `/chat` proxies PCM to ESP32. */
+const XAI_STT_URL = 'https://api.x.ai/v1/stt'
+const XAI_TTS_URL = 'https://api.x.ai/v1/tts'
+/** Streaming endpoint (binary audio body); `/chat` proxies PCM to ESP32 for Sarvam path. */
 const SARVAM_TTS_STREAM_URL = 'https://api.sarvam.ai/text-to-speech/stream'
-const SARVAM_STT_MODEL = 'saaras:v3'
 const SARVAM_TTS_MODEL = 'bulbul:v3'
 /** Defaults aligned with Sarvam streaming hi-IN preset (ESP uses linear16, not mp3). */
 const SARVAM_TTS_DEFAULT_SPEAKER = 'simran'
@@ -59,12 +52,32 @@ const SARVAM_TTS_ENABLE_PREPROCESSING = true
 const SARVAM_TTS_OUTPUT_CODEC = 'linear16' as const
 const SARVAM_TTS_PCM_CHUNK_BYTES = 8192 // ReadableStream enqueue size (downstream chunked TE)
 const SARVAM_TTS_CHAR_LIMIT = 2500 // bulbul:v3 caps at 2500; keep headroom for safety
+/** xAI TTS allows up to ~15k chars; stay slightly under */
+const XAI_TTS_CHAR_LIMIT = 14000
+const DEFAULT_CHAT_LANGUAGE_CODE = 'en'
+const XAI_TTS_VOICE_INTERNATIONAL = 'eve'
 /** Keep total response headers within safe proxy limits (`x-reply-text` is URL-encoded). */
 const CHAT_REPLY_HEADER_MAX_ENCODED_BYTES = 6144
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap (ESP32 payloads are tiny; xAI allows large files)
 const MAX_HISTORY_MESSAGES = 50 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
 const OPENHORIZON_MODEL = 'openhorizon/gemma4:latest'
+
+/** Primary ISO 639-1 tags treated as Indian languages → Sarvam TTS. */
+const INDIAN_PRIMARY_LANG_TAGS = new Set([
+  'as',
+  'bn',
+  'gu',
+  'hi',
+  'kn',
+  'ml',
+  'mr',
+  'or',
+  'pa',
+  'ta',
+  'te',
+  'ur',
+])
 
 const VALID_MODES = ['transcribe', 'translate', 'verbatim', 'translit', 'codemix'] as const
 type Mode = (typeof VALID_MODES)[number]
@@ -94,8 +107,9 @@ app.get('/', (c) =>
     name: 'open-eve-backend',
     description: 'Voice agent for the Open EvE desk robot (ESP32 + mic + BT speaker)',
     upstreams: {
-      stt: 'sarvam.ai/speech-to-text (Saaras v3)',
-      tts: 'sarvam.ai/text-to-speech/stream (Bulbul v3 → PCM for ESP32)',
+      stt: 'x.ai/v1/stt',
+      tts_intl: 'x.ai/v1/tts → PCM eve @ 24 kHz',
+      tts_in: 'sarvam.ai/text-to-speech/stream (Bulbul v3 → PCM)',
       llm: `${OPENHORIZON_MODEL} via Vercel AI SDK`,
       websearch: 'firecrawl.dev /search',
     },
@@ -104,7 +118,7 @@ app.get('/', (c) =>
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
       'POST /chat':
-        'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 24000 Hz); reply text in x-reply-text (optional ?envelope=1 for JSON prefix + PCM)',
+        'text -> agent -> TTS: Indian langs Sarvam PCM, else xAI eve PCM @ 24 kHz; x-reply-text; optional ?envelope=1',
     },
   })
 )
@@ -112,8 +126,9 @@ app.get('/', (c) =>
 app.get('/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
 
 app.post('/transcribe', async (c) => {
-  if (!c.env.SARVAM_API_KEY) {
-    throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured on the server' })
+  const xaiKey = bindingSecret(c.env.XAI_API_KEY)
+  if (!xaiKey) {
+    throw new HTTPException(500, { message: 'XAI_API_KEY is not configured on the server' })
   }
 
   const mode = (c.req.query('mode') ?? 'transcribe') as Mode
@@ -122,7 +137,7 @@ app.post('/transcribe', async (c) => {
       message: `Invalid mode '${mode}'. Allowed: ${VALID_MODES.join(', ')}`,
     })
   }
-  const languageCode = c.req.query('language_code') || undefined
+  const languageHintQuery = (c.req.query('language_code') || '').trim() || undefined
 
   const contentTypeHeader = (c.req.header('content-type') ?? '').toLowerCase()
   const baseContentType = contentTypeHeader.split(';')[0].trim()
@@ -190,34 +205,30 @@ app.post('/transcribe', async (c) => {
     })
   }
 
-  const sarvamForm = new FormData()
-  sarvamForm.append('model', SARVAM_STT_MODEL)
-  sarvamForm.append('mode', mode)
-  if (languageCode) sarvamForm.append('language_code', languageCode)
-  sarvamForm.append('file', audioBlob, filename)
+  const xaiForm = buildXaiSttFormData(audioBlob, filename, languageHintQuery)
 
   let upstream: Response
   try {
-    upstream = await fetch(SARVAM_STT_URL, {
+    upstream = await fetch(XAI_STT_URL, {
       method: 'POST',
       headers: {
-        'api-subscription-key': c.env.SARVAM_API_KEY,
+        Authorization: `Bearer ${xaiKey}`,
       },
-      body: sarvamForm,
+      body: xaiForm,
     })
   } catch (err) {
     throw new HTTPException(502, {
-      message: `Failed to reach Sarvam API: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Failed to reach xAI STT API: ${err instanceof Error ? err.message : String(err)}`,
     })
   }
 
   const rawBody = await upstream.text()
-  const parsedBody = safeJsonParse(rawBody)
+  const parsedBody = safeJsonParse(rawBody) as Record<string, unknown> | null
 
   if (!upstream.ok) {
     return c.json(
       {
-        error: 'Sarvam API returned an error',
+        error: 'xAI STT returned an error',
         upstream_status: upstream.status,
         upstream_body: parsedBody ?? rawBody,
       },
@@ -225,11 +236,23 @@ app.post('/transcribe', async (c) => {
     )
   }
 
-  return c.json(parsedBody ?? { raw: rawBody })
+  const transcript =
+    parsedBody != null && typeof parsedBody.text === 'string'
+      ? parsedBody.text
+      : parsedBody != null && typeof parsedBody.transcript === 'string'
+        ? parsedBody.transcript
+        : ''
+  const detectedName =
+    parsedBody != null && typeof parsedBody.language === 'string' ? parsedBody.language : ''
+
+  return c.json({
+    transcript,
+    language_code: mapXaiDetectedLanguageToCode(detectedName),
+  })
 })
 
 // ---------------------------------------------------------------------------
-// /chat : agent -> Sarvam streaming TTS -> PCM proxy for ESP32
+// /chat : agent -> conditional TTS (Sarvam Indian | xAI international) -> PCM
 // ---------------------------------------------------------------------------
 
 type ChatTurn = { role: 'user' | 'assistant'; content: string }
@@ -237,8 +260,8 @@ type ChatTurn = { role: 'user' | 'assistant'; content: string }
 const ChatBodySchema = z.object({
   deviceId: z.string().min(1).max(64),
   text: z.string().min(1).max(2000),
-  // Optional BCP-47 hint forwarded to Sarvam Bulbul TTS.
-  language_code: z.string().min(2).max(10).optional(),
+  // BCP-47 from STT (`/transcribe`): steers TTS provider and voice.
+  language_code: z.string().min(2).max(16).optional(),
   speaker: z.string().min(1).max(32).optional(),
   pace: z.number().min(0.5).max(2).optional(),
   enable_preprocessing: z.boolean().optional(),
@@ -247,9 +270,7 @@ const ChatBodySchema = z.object({
 })
 
 app.post('/chat', async (c) => {
-  if (!c.env.SARVAM_API_KEY) {
-    throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured' })
-  }
+  const xaiKey = bindingSecret(c.env.XAI_API_KEY)
   const openHorizonApiKey = bindingSecret(c.env.OPENHORIZON_API_KEY)
   if (!openHorizonApiKey) {
     throw new HTTPException(500, { message: 'OPENHORIZON_API_KEY is not configured' })
@@ -269,7 +290,18 @@ app.post('/chat', async (c) => {
     })
   }
   const { deviceId, text, reset } = parsed.data
-  const languageCode = parsed.data.language_code ?? SARVAM_TTS_DEFAULT_LANG
+  const langRaw = (parsed.data.language_code ?? DEFAULT_CHAT_LANGUAGE_CODE).trim()
+  const useIndianTts = isIndianLanguage(langRaw)
+  if (useIndianTts) {
+    if (!bindingSecret(c.env.SARVAM_API_KEY)) {
+      throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured (required for Indian-language TTS)' })
+    }
+  } else if (!xaiKey) {
+    throw new HTTPException(500, { message: 'XAI_API_KEY is not configured (required for non-Indian TTS)' })
+  }
+
+  const languageCode = langRaw.length >= 2 ? langRaw : DEFAULT_CHAT_LANGUAGE_CODE
+  const ttsCharLimit = useIndianTts ? SARVAM_TTS_CHAR_LIMIT : XAI_TTS_CHAR_LIMIT
   const speaker = parsed.data.speaker ?? SARVAM_TTS_DEFAULT_SPEAKER
   const ttsPace = parsed.data.pace ?? SARVAM_TTS_PACE
   const ttsPreprocess =
@@ -330,7 +362,7 @@ app.post('/chat', async (c) => {
     "If a fact is time sensitive (today, latest, current, live, now) call the " +
     "webSearch tool first and cite the answer succinctly. " +
     "Speak the same language the user used. " +
-    `Hard limit: never exceed ${SARVAM_TTS_CHAR_LIMIT} characters.`
+    `Hard limit: never exceed ${ttsCharLimit} characters.`
 
   let reply: string
   try {
@@ -353,7 +385,7 @@ app.post('/chat', async (c) => {
   }
 
   if (!reply) reply = 'Sorry, I did not catch that. Could you say it again?'
-  if (reply.length > SARVAM_TTS_CHAR_LIMIT) reply = reply.slice(0, SARVAM_TTS_CHAR_LIMIT)
+  if (reply.length > ttsCharLimit) reply = reply.slice(0, ttsCharLimit)
 
   const newHist: ChatTurn[] = [
     ...history,
@@ -365,9 +397,50 @@ app.post('/chat', async (c) => {
     c.env.SESSIONS.put(histKey, JSON.stringify(newHist), { expirationTtl: HISTORY_TTL_SECONDS })
   )
 
+  const pcmHeaders = chatPcmResponseHeaders(reply, newHist.length, useEnvelope, SARVAM_TTS_SAMPLE_RATE)
+
+  if (!useIndianTts) {
+    const ttsBody = {
+      text: reply,
+      voice_id: XAI_TTS_VOICE_INTERNATIONAL,
+      language: languageForXaiTts(languageCode),
+      output_format: {
+        codec: 'pcm',
+        sample_rate: SARVAM_TTS_SAMPLE_RATE,
+      },
+    }
+    let ttsResp: Response
+    try {
+      ttsResp = await fetch(XAI_TTS_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${xaiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(ttsBody),
+      })
+    } catch (err) {
+      throw new HTTPException(502, {
+        message: 'Failed to reach xAI TTS: ' + (err instanceof Error ? err.message : String(err)),
+      })
+    }
+    if (!ttsResp.ok) {
+      const detail = await ttsResp.text()
+      throw new HTTPException(502, { message: `xAI TTS error ${ttsResp.status}: ${detail}` })
+    }
+    const rawPcm = new Uint8Array(await ttsResp.arrayBuffer())
+    const pcm = stripWavHeaderIfPresent(rawPcm)
+    let stream: ReadableStream<Uint8Array> = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
+    if (useEnvelope) {
+      stream = prependUint8ThenReadable(pcmEnvelopePrefix(reply), stream)
+    }
+    return new Response(stream, { status: 200, headers: pcmHeaders })
+  }
+
+  const sarvamKey = bindingSecret(c.env.SARVAM_API_KEY)
   const ttsPayload = {
     text: reply,
-    target_language_code: languageCode,
+    target_language_code: languageCode.includes('-') ? languageCode : `${primaryLanguageSubtag(languageCode)}-IN`,
     model: SARVAM_TTS_MODEL,
     speaker,
     speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
@@ -381,7 +454,7 @@ app.post('/chat', async (c) => {
     ttsResp = await fetch(SARVAM_TTS_STREAM_URL, {
       method: 'POST',
       headers: {
-        'api-subscription-key': c.env.SARVAM_API_KEY,
+        'api-subscription-key': sarvamKey,
         'content-type': 'application/json',
       },
       body: JSON.stringify(ttsPayload),
@@ -398,8 +471,6 @@ app.post('/chat', async (c) => {
   }
 
   const upstreamCt = (ttsResp.headers.get('content-type') ?? '').toLowerCase()
-
-  const pcmHeaders = chatPcmResponseHeaders(reply, newHist.length, useEnvelope)
 
   if (upstreamCt.includes('application/json')) {
     const ttsJson = (await ttsResp.json().catch(() => null)) as { audios?: string[] } | null
@@ -440,11 +511,100 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal server error', details: String(err) }, 500)
 })
 
-export default app
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** xAI STT returns a display language name; map to BCP-style hints for /chat + firmware. */
+const XAI_STT_LANGUAGE_NAME_TO_HINT: Record<string, string> = {
+  arabic: 'ar',
+  czech: 'cs',
+  danish: 'da',
+  dutch: 'nl',
+  english: 'en',
+  filipino: 'fil',
+  french: 'fr',
+  german: 'de',
+  hindi: 'hi-IN',
+  indonesian: 'id',
+  italian: 'it',
+  japanese: 'ja',
+  korean: 'ko',
+  macedonian: 'mk',
+  malay: 'ms',
+  persian: 'fa',
+  polish: 'pl',
+  portuguese: 'pt',
+  romanian: 'ro',
+  russian: 'ru',
+  spanish: 'es',
+  swedish: 'sv',
+  thai: 'th',
+  turkish: 'tr',
+  vietnamese: 'vi',
+  bengali: 'bn-IN',
+  urdu: 'ur-IN',
+  tamil: 'ta-IN',
+  telugu: 'te-IN',
+  kannada: 'kn-IN',
+  malayalam: 'ml-IN',
+  marathi: 'mr-IN',
+  gujarati: 'gu-IN',
+  punjabi: 'pa-IN',
+  odia: 'or-IN',
+  assamese: 'as-IN',
+}
+
+function primaryLanguageSubtag(languageCodeHint: string): string {
+  return languageCodeHint.trim().split(/[-_]/)[0].toLowerCase()
+}
+
+function isIndianLanguage(languageCodeHint: string): boolean {
+  return INDIAN_PRIMARY_LANG_TAGS.has(primaryLanguageSubtag(languageCodeHint))
+}
+
+function mapXaiDetectedLanguageToCode(detectedLanguage: string): string {
+  const k = detectedLanguage.trim().toLowerCase()
+  if (!k) return DEFAULT_CHAT_LANGUAGE_CODE
+  return XAI_STT_LANGUAGE_NAME_TO_HINT[k] ?? DEFAULT_CHAT_LANGUAGE_CODE
+}
+
+/** Non-file fields first; `file` must be last per xAI docs. */
+function buildXaiSttFormData(audioBlob: Blob, filename: string, queryLanguageHint?: string): FormData {
+  const fd = new FormData()
+  const hint = queryLanguageHint?.trim()
+  if (hint) {
+    fd.append('format', 'true')
+    fd.append('language', primaryLanguageSubtag(hint))
+  }
+  fd.append('file', audioBlob, filename)
+  return fd
+}
+
+/** Map user/STT language hint to xAI TTS `language` (BCP-ish / `auto`). */
+function languageForXaiTts(languageCodeHint: string): string {
+  const raw = languageCodeHint.trim().toLowerCase()
+  const p = primaryLanguageSubtag(raw)
+  if (p === 'en' || raw.startsWith('en-')) return 'en'
+  if (p === 'zh' || raw.startsWith('zh-')) return 'zh'
+  const direct: Record<string, string> = {
+    fr: 'fr',
+    de: 'de',
+    ja: 'ja',
+    ko: 'ko',
+    ru: 'ru',
+    hi: 'hi',
+    bn: 'bn',
+    it: 'it',
+    id: 'id',
+    tr: 'tr',
+    vi: 'vi',
+    es: 'es-ES',
+    pt: 'pt-BR',
+    ar: 'ar-SA',
+  }
+  return direct[p] ?? 'auto'
+}
 
 /** Trim Worker secrets — pasted keys often include accidental newlines. */
 function bindingSecret(value: string | undefined): string {
@@ -517,7 +677,7 @@ interface PcmInfo {
 
 /**
  * Build a 44-byte canonical PCM WAV file in front of the supplied samples.
- * Sarvam's REST API rejects raw PCM, so we wrap it before forwarding.
+ * xAI STT (and historical Sarvam) expect a container; raw PCM from the ESP32 is wrapped here.
  */
 function wrapPcmInWav(pcm: Uint8Array, info: PcmInfo): Uint8Array {
   const { sampleRate, channels, bitsPerSample } = info
@@ -677,12 +837,17 @@ function prependUint8ThenReadable(
   })
 }
 
-function chatPcmResponseHeaders(reply: string, historyLen: number, envelope: boolean): HeadersInit {
+function chatPcmResponseHeaders(
+  reply: string,
+  historyLen: number,
+  envelope: boolean,
+  pcmSampleRate: number
+): HeadersInit {
   const { value, truncated } = encodeReplyForHeader(reply, CHAT_REPLY_HEADER_MAX_ENCODED_BYTES)
   const headers: Record<string, string> = {
     'content-type': 'application/octet-stream',
     'cache-control': 'no-cache',
-    'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
+    'x-pcm-sample-rate': String(pcmSampleRate),
     'x-reply-text': value,
     'x-history-len': String(historyLen),
   }
@@ -690,3 +855,5 @@ function chatPcmResponseHeaders(reply: string, historyLen: number, envelope: boo
   if (envelope) headers['x-open-eve-envelope'] = 'json-length-pcm-v1'
   return headers
 }
+
+export default app
