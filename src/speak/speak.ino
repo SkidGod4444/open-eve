@@ -11,6 +11,35 @@ const char* WIFI_SSID = "GALGOTIAS-ARUBA";
 const char* WIFI_PASS = "1234567@";
 static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 
+/** Set to 0 to restore always-listening (every utterance goes to /chat). */
+#ifndef OPEN_EVE_REQUIRE_WAKE_WORD
+#define OPEN_EVE_REQUIRE_WAKE_WORD 1
+#endif
+#ifndef OPEN_EVE_WAKE_WORD
+#define OPEN_EVE_WAKE_WORD "eve"
+#endif
+/** Devanagari “ईव” (how STT often writes “Eve”) — UTF-8 bytes. */
+#ifndef OPEN_EVE_WAKE_WORD_HI_UTF8
+#define OPEN_EVE_WAKE_WORD_HI_UTF8 "\xe0\xa5\x88\xe0\xa5\xb5"
+#endif
+/** Alternate Hindi spelling “इव” — UTF-8. */
+#ifndef OPEN_EVE_WAKE_WORD_HI_ALT_UTF8
+#define OPEN_EVE_WAKE_WORD_HI_ALT_UTF8 "\xe0\xa5\x87\xe0\xa5\xb5"
+#endif
+
+/**
+ * Offline wake (no HTTP while idle): active-low GPIO (button to GND). On a press edge,
+ * ONE following utterance may use STT + /chat + TTS. While not armed, loud speech is ignored
+ * locally (no upload, no Sarvam, no Worker).
+ *
+ * Spoken “eve” without cloud STT is not implementable in plain C++ on the ESP32 — you need
+ * on-device WakeNet / ESP_SR (ESP32-S3 + SR partition + trained model) or a third-party wake lib.
+ * Set this to **-1** to use transcript-based wake instead (calls /transcribe on every utterance).
+ */
+#ifndef OPEN_EVE_HARDWARE_WAKE_GPIO
+#define OPEN_EVE_HARDWARE_WAKE_GPIO -1
+#endif
+
 // ===== MIC (I2S0) =====
 #define I2S_WS    15
 #define I2S_SCK   16
@@ -329,6 +358,104 @@ static String transcriptFromSttResponse(const String& sttJson) {
 static String languageFromSttResponse(const String& sttJson) {
   return jsonStringFieldAfterKey(sttJson, "\"language_code\":\"");
 }
+
+#if OPEN_EVE_REQUIRE_WAKE_WORD && OPEN_EVE_HARDWARE_WAKE_GPIO < 0
+static bool gWakeCommandArmed = false;
+
+static inline bool isAsciiLatinLetter(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/** Trim ASCII punctuation / whitespace from both ends without touching UTF-8 Devanagari bytes. */
+static void stripAsciiEdges(String& s) {
+  const char* punct = ".,!?;: \t\r\n";
+  bool changed = true;
+  while (changed && s.length()) {
+    changed = false;
+    char c0 = s.charAt(0);
+    if ((uint8_t)(unsigned char)c0 < 128U && strchr(punct, c0)) {
+      s.remove(0, 1);
+      changed = true;
+      continue;
+    }
+    char c1 = s.charAt(s.length() - 1);
+    if ((uint8_t)(unsigned char)c1 < 128U && strchr(punct, c1)) {
+      s.remove(s.length() - 1);
+      changed = true;
+    }
+  }
+}
+
+/** Lowercase ASCII string; wake is lowercase — boundaries so "Hello Eve," matches but not "evening". */
+static bool latinWakeWordPresent(const String& lower, const String& wake) {
+  int wl = wake.length();
+  if (wl <= 0 || (int)lower.length() < wl)
+    return false;
+  int searchStart = 0;
+  for (;;) {
+    int idx = lower.indexOf(wake, searchStart);
+    if (idx < 0)
+      return false;
+    bool okBefore =
+        idx == 0 || !isAsciiLatinLetter(lower.charAt(idx - 1));
+    int afterIdx = idx + wl;
+    bool okAfter =
+        afterIdx >= (int)lower.length() ||
+        !isAsciiLatinLetter(lower.charAt(afterIdx));
+    if (okBefore && okAfter)
+      return true;
+    searchStart = idx + 1;
+  }
+}
+
+static bool transcriptContainsWakeWord(const String& transcript) {
+  String t = transcript;
+  t.trim();
+  if (t.length() == 0)
+    return false;
+
+  if (t.indexOf(String(OPEN_EVE_WAKE_WORD_HI_UTF8)) >= 0)
+    return true;
+  if (t.indexOf(String(OPEN_EVE_WAKE_WORD_HI_ALT_UTF8)) >= 0)
+    return true;
+
+  String lo = t;
+  lo.toLowerCase();
+  String wake = String(OPEN_EVE_WAKE_WORD);
+  if (wake.length() == 0)
+    return false;
+
+  return latinWakeWordPresent(lo, wake);
+}
+
+/** True only when the utterance is just the wake token (Latin or Hindi), optional ASCII punctuation. */
+static bool utteranceIsWakeOnly(const String& transcript) {
+  String s = transcript;
+  s.trim();
+  if (!s.length())
+    return false;
+
+  String latin = s;
+  stripAsciiEdges(latin);
+  latin.toLowerCase();
+  if (latin.length() && latin == String(OPEN_EVE_WAKE_WORD))
+    return true;
+
+  String hi = s;
+  stripAsciiEdges(hi);
+  if (hi.length() && hi == String(OPEN_EVE_WAKE_WORD_HI_UTF8))
+    return true;
+  if (hi.length() && hi == String(OPEN_EVE_WAKE_WORD_HI_ALT_UTF8))
+    return true;
+
+  return false;
+}
+#endif
+
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+static bool gHwWakePendingUtterance = false;
+static bool gHwWakePrevPinLow = false;
+#endif
 
 static bool jsonEscapeInto(String& out, const char* s) {
   out = "";
@@ -965,6 +1092,24 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   return played;
 }
 
+static unsigned long pcmBytesToAudioMs(size_t pcmBytes) {
+  pcmBytes &= ~(size_t)1;
+  return pcmBytes > 0 ? ((pcmBytes / 2) * 1000UL / (unsigned long)SAMPLE_RATE_OUT) : 0UL;
+}
+
+static unsigned long computeMuteGuardMs(unsigned long audioMs) {
+  unsigned long extraLong =
+      audioMs / 8UL > (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
+          ? (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
+          : audioMs / 8UL;
+  unsigned long guard = (unsigned long)VAD_AFTER_PLAY_PADDING_MS + extraLong;
+  if (guard < (unsigned long)VAD_COOLDOWN_MIN_MS)
+    guard = (unsigned long)VAD_COOLDOWN_MIN_MS;
+  if (guard > 90000UL)
+    guard = 90000UL;
+  return guard;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -981,12 +1126,30 @@ void setup() {
   }
   setupI2SMic();
   setupI2SSpeaker();
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+  pinMode(OPEN_EVE_HARDWARE_WAKE_GPIO, INPUT_PULLUP);
+  Serial.printf("[CONFIG] Hardware wake GPIO %d (active LOW) — idle audio stays offline\n",
+                OPEN_EVE_HARDWARE_WAKE_GPIO);
+#elif OPEN_EVE_REQUIRE_WAKE_WORD
+  Serial.print("[CONFIG] Cloud wake (STT every utterance), token: ");
+  Serial.println(OPEN_EVE_WAKE_WORD);
+#endif
   Serial.printf("[READY] heap=%u\n", (unsigned)ESP.getFreeHeap());
 }
 
 void loop() {
   static int16_t audio[BUFFER_SIZE];
   static unsigned long vadCooldownUntilMs = 0;
+
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+  bool pinLow = digitalRead(OPEN_EVE_HARDWARE_WAKE_GPIO) == LOW;
+  if (!gHwWakePendingUtterance && pinLow && !gHwWakePrevPinLow) {
+    gHwWakePendingUtterance = true;
+    Serial.println("[WAKE] armed (GPIO) — speak now");
+    vadCooldownUntilMs = millis() + 400;
+  }
+  gHwWakePrevPinLow = pinLow;
+#endif
 
   unsigned long now = millis();
   if (now < vadCooldownUntilMs) {
@@ -1002,6 +1165,13 @@ void loop() {
   }
 
   if (peak > VAD_PEAK_THRESHOLD) {
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+    if (!gHwWakePendingUtterance) {
+      Serial.println("[WAKE] idle (offline) — press wake GPIO then speak");
+      vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
+      return;
+    }
+#endif
     if (!g_sttCapturePcm) {
       if (!allocSttCaptureBuffer()) {
         vadCooldownUntilMs = millis() + 3000;
@@ -1056,27 +1226,61 @@ void loop() {
     transcript.trim();
     Serial.println("[YOU] " + transcript);
 
-    if (transcript.length() > 0) {
-      size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
-      pcmBytes &= ~(size_t)1;
-      unsigned long audioMs =
-          pcmBytes > 0 ? ((pcmBytes / 2) * 1000UL / (unsigned long)SAMPLE_RATE_OUT) : 0;
-      /* Playback already ran for audioMs; do not add full audioMs again or mute doubles clip length. */
-      unsigned long extraLong =
-          audioMs / 8UL > (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
-              ? (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
-              : audioMs / 8UL;
-      unsigned long guard =
-          (unsigned long)VAD_AFTER_PLAY_PADDING_MS + extraLong;
-      if (guard < (unsigned long)VAD_COOLDOWN_MIN_MS)
-        guard = (unsigned long)VAD_COOLDOWN_MIN_MS;
-      if (guard > 90000UL)
-        guard = 90000UL;
-      vadCooldownUntilMs = millis() + guard;
-      Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n", guard,
-                    audioMs);
-    } else {
+    if (transcript.length() == 0) {
+#if OPEN_EVE_REQUIRE_WAKE_WORD && OPEN_EVE_HARDWARE_WAKE_GPIO < 0
+      if (gWakeCommandArmed) {
+        gWakeCommandArmed = false;
+        Serial.println("[WAKE] disarmed (empty transcript)");
+      }
+#endif
       vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
+    } else {
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+      size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
+      unsigned long audioMs = pcmBytesToAudioMs(pcmBytes);
+      unsigned long guardMs = computeMuteGuardMs(audioMs);
+      vadCooldownUntilMs = millis() + guardMs;
+      Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n",
+                    guardMs, audioMs);
+#elif OPEN_EVE_REQUIRE_WAKE_WORD
+      if (!gWakeCommandArmed) {
+        if (!transcriptContainsWakeWord(transcript)) {
+          Serial.println("[WAKE] ignored — include eve / Hindi wake name in your sentence");
+          vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
+        } else if (utteranceIsWakeOnly(transcript)) {
+          gWakeCommandArmed = true;
+          Serial.println("[WAKE] listening — ask your question");
+          vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
+        } else {
+          gWakeCommandArmed = false;
+          size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
+          unsigned long audioMs = pcmBytesToAudioMs(pcmBytes);
+          unsigned long guardMs = computeMuteGuardMs(audioMs);
+          vadCooldownUntilMs = millis() + guardMs;
+          Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n",
+                        guardMs, audioMs);
+        }
+      } else {
+        gWakeCommandArmed = false;
+        size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
+        unsigned long audioMs = pcmBytesToAudioMs(pcmBytes);
+        unsigned long guardMs = computeMuteGuardMs(audioMs);
+        vadCooldownUntilMs = millis() + guardMs;
+        Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n",
+                      guardMs, audioMs);
+      }
+#else
+      size_t pcmBytes = sendChatAndSpeak(transcript, langHint);
+      unsigned long audioMs = pcmBytesToAudioMs(pcmBytes);
+      unsigned long guardMs = computeMuteGuardMs(audioMs);
+      vadCooldownUntilMs = millis() + guardMs;
+      Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n",
+                    guardMs, audioMs);
+#endif
     }
+
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+    gHwWakePendingUtterance = false;
+#endif
   }
 }
