@@ -16,7 +16,11 @@ import { z } from 'zod'
  *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
  *   POST /chat        Text -> agent -> Sarvam Bulbul v3 **streaming** TTS
  *                     (`/text-to-speech/stream`) -> mono PCM s16le for ESP32
- *                     (`linear16`, default 8 kHz). Clients that need MP3 should call
+ *                     (`linear16`, default 22.05 kHz). Assistant **reply text** is also
+ *                     returned as URL-encoded `x-reply-text` (truncated only if huge).
+ *                     Optional `?envelope=1`: body begins with 4-byte BE JSON length +
+ *                     UTF-8 `{"reply":"..."}` then raw PCM (same sample rate).
+ *                     Clients that need MP3 should call
  *                     Sarvam directly; bare I2S expects PCM only.
  *                     Conversation history (last 6 turns) is kept in
  *                     Cloudflare KV per `deviceId`.
@@ -47,13 +51,16 @@ const SARVAM_TTS_MODEL = 'bulbul:v3'
 /** Defaults aligned with Sarvam streaming hi-IN preset (ESP uses linear16, not mp3). */
 const SARVAM_TTS_DEFAULT_SPEAKER = 'simran'
 const SARVAM_TTS_DEFAULT_LANG = 'hi-IN'
-const SARVAM_TTS_SAMPLE_RATE = 8000
+/** Speech bandwidth: 8 kHz sounds telephone-muffled; 22050 Hz is a good ESP32/I2S tradeoff vs 24k. */
+const SARVAM_TTS_SAMPLE_RATE = 22050
 const SARVAM_TTS_PACE = 1.2
 const SARVAM_TTS_ENABLE_PREPROCESSING = true
 /** Must stay linear16 for Open EvE firmware I2S playback. */
 const SARVAM_TTS_OUTPUT_CODEC = 'linear16' as const
 const SARVAM_TTS_PCM_CHUNK_BYTES = 8192 // ReadableStream enqueue size (downstream chunked TE)
 const SARVAM_TTS_CHAR_LIMIT = 2500 // bulbul:v3 caps at 2500; keep headroom for safety
+/** Keep total response headers within safe proxy limits (`x-reply-text` is URL-encoded). */
+const CHAT_REPLY_HEADER_MAX_ENCODED_BYTES = 6144
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
 const MAX_HISTORY_MESSAGES = 50 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
@@ -71,6 +78,13 @@ app.use(
     origin: '*',
     allowMethods: ['GET', 'POST', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
+    exposeHeaders: [
+      'x-reply-text',
+      'x-reply-truncated',
+      'x-pcm-sample-rate',
+      'x-history-len',
+      'x-open-eve-envelope',
+    ],
     maxAge: 86400,
   })
 )
@@ -89,7 +103,8 @@ app.get('/', (c) =>
       'GET /': 'this index',
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
-      'POST /chat': 'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 8 kHz)',
+      'POST /chat':
+        'text -> agent -> Sarvam streaming TTS -> PCM s16le mono (default 22050 Hz); reply text in x-reply-text (optional ?envelope=1 for JSON prefix + PCM)',
     },
   })
 )
@@ -259,6 +274,9 @@ app.post('/chat', async (c) => {
   const ttsPace = parsed.data.pace ?? SARVAM_TTS_PACE
   const ttsPreprocess =
     parsed.data.enable_preprocessing ?? SARVAM_TTS_ENABLE_PREPROCESSING
+  const envelopeParam = (c.req.query('envelope') ?? '').toLowerCase()
+  const useEnvelope =
+    envelopeParam === '1' || envelopeParam === 'true' || envelopeParam === 'yes'
 
   const histKey = `hist:${deviceId}`
   const history = reset
@@ -381,22 +399,21 @@ app.post('/chat', async (c) => {
 
   const upstreamCt = (ttsResp.headers.get('content-type') ?? '').toLowerCase()
 
+  const pcmHeaders = chatPcmResponseHeaders(reply, newHist.length, useEnvelope)
+
   if (upstreamCt.includes('application/json')) {
     const ttsJson = (await ttsResp.json().catch(() => null)) as { audios?: string[] } | null
     if (!ttsJson?.audios?.length) {
       throw new HTTPException(502, { message: 'Sarvam TTS returned JSON without audio' })
     }
     const pcm = pcmPayloadFromTtsAudios(ttsJson.audios)
-    const stream = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
+    let stream: ReadableStream<Uint8Array> = streamUint8ArrayInChunks(pcm, SARVAM_TTS_PCM_CHUNK_BYTES)
+    if (useEnvelope) {
+      stream = prependUint8ThenReadable(pcmEnvelopePrefix(reply), stream)
+    }
     return new Response(stream, {
       status: 200,
-      headers: {
-        'content-type': 'application/octet-stream',
-        'cache-control': 'no-cache',
-        'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
-        'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
-        'x-history-len': String(newHist.length),
-      },
+      headers: pcmHeaders,
     })
   }
 
@@ -404,15 +421,14 @@ app.post('/chat', async (c) => {
     throw new HTTPException(502, { message: 'Sarvam TTS stream returned no body' })
   }
 
-  return new Response(ttsResp.body, {
+  let outBody: ReadableStream<Uint8Array> = ttsResp.body
+  if (useEnvelope) {
+    outBody = prependUint8ThenReadable(pcmEnvelopePrefix(reply), outBody)
+  }
+
+  return new Response(outBody, {
     status: 200,
-    headers: {
-      'content-type': 'application/octet-stream',
-      'cache-control': 'no-cache',
-      'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
-      'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
-      'x-history-len': String(newHist.length),
-    },
+    headers: pcmHeaders,
   })
 })
 
@@ -610,4 +626,67 @@ function streamUint8ArrayInChunks(buffer: Uint8Array, chunkSize: number): Readab
       offset = end
     },
   })
+}
+
+function encodeReplyForHeader(reply: string, maxEncodedBytes: number): { value: string; truncated: boolean } {
+  let n = reply.length
+  while (n > 0) {
+    const enc = encodeURIComponent(reply.slice(0, n))
+    if (enc.length <= maxEncodedBytes) {
+      return { value: enc, truncated: n < reply.length }
+    }
+    n -= 1
+  }
+  return { value: '', truncated: reply.length > 0 }
+}
+
+/** Optional body prefix when `POST /chat?envelope=1`: BE uint32 JSON byte length + UTF-8 `{"reply":"..."}`. */
+function pcmEnvelopePrefix(reply: string): Uint8Array {
+  const jsonBytes = new TextEncoder().encode(JSON.stringify({ reply }))
+  const out = new Uint8Array(4 + jsonBytes.byteLength)
+  new DataView(out.buffer).setUint32(0, jsonBytes.byteLength, false)
+  out.set(jsonBytes, 4)
+  return out
+}
+
+function prependUint8ThenReadable(
+  prefix: Uint8Array,
+  body: ReadableStream<Uint8Array>
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  let prefixSent = false
+  return new ReadableStream({
+    pull(controller) {
+      return (async () => {
+        if (!prefixSent) {
+          controller.enqueue(prefix)
+          prefixSent = true
+          return
+        }
+        const { done, value } = await reader.read()
+        if (done) {
+          controller.close()
+          return
+        }
+        if (value.byteLength) controller.enqueue(value)
+      })()
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+}
+
+function chatPcmResponseHeaders(reply: string, historyLen: number, envelope: boolean): HeadersInit {
+  const { value, truncated } = encodeReplyForHeader(reply, CHAT_REPLY_HEADER_MAX_ENCODED_BYTES)
+  const headers: Record<string, string> = {
+    'content-type': 'application/octet-stream',
+    'cache-control': 'no-cache',
+    'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
+    'x-reply-text': value,
+    'x-history-len': String(historyLen),
+  }
+  if (truncated) headers['x-reply-truncated'] = '1'
+  if (envelope) headers['x-open-eve-envelope'] = 'json-length-pcm-v1'
+  return headers
 }
