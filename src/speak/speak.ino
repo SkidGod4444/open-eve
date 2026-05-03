@@ -22,7 +22,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define I2S_OUT_SD   21
 
 #define SAMPLE_RATE_MIC 16000
-#define SAMPLE_RATE_OUT 24000
+#define SAMPLE_RATE_OUT 22050
 
 #define BUFFER_SIZE 1024
 
@@ -41,23 +41,47 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 #define VAD_PEAK_THRESHOLD 2800
 #endif
 
-/** Max PCM body size to buffer before playback (then play once — avoids stream underruns). */
+/** Max PCM body size when using buffered mode (mode 0). */
 #ifndef CHAT_PCM_MAX_BYTES
 #define CHAT_PCM_MAX_BYTES (640 * 1024)
 #endif
 
-// Mic picks up speaker → false VAD; stay deaf for (audio length + pad).
+/**
+ * 0 = Wait for full download, normalize once, play once — recommended (fewer echo/VAD issues).
+ * 1 = Stream with jitter prefill — faster first sound but easier to get mic↔speaker feedback.
+ */
+#ifndef CHAT_PCM_PLAY_MODE
+#define CHAT_PCM_PLAY_MODE 0
+#endif
+
+#ifndef PCM_JITTER_BYTES
+#define PCM_JITTER_BYTES 57344
+#endif
+/** Stream mode: minimum queued PCM before first I2S write (~128 ms @ 22.05 kHz when 6144). */
+#ifndef PCM_STREAM_PREFILL_BYTES
+#define PCM_STREAM_PREFILL_BYTES 6144
+#endif
+#ifndef PCM_STREAM_DRAIN_BLOCK_BYTES
+#define PCM_STREAM_DRAIN_BLOCK_BYTES 4096
+#endif
+
+// After playback finishes, mic stays off for this long (echo guard). Not additive with clip length.
 #ifndef VAD_AFTER_PLAY_PADDING_MS
-#define VAD_AFTER_PLAY_PADDING_MS 6500
+#define VAD_AFTER_PLAY_PADDING_MS 3200
 #endif
 #ifndef VAD_COOLDOWN_EMPTY_MS
 #define VAD_COOLDOWN_EMPTY_MS 1800
 #endif
 #ifndef VAD_COOLDOWN_MIN_MS
-#define VAD_COOLDOWN_MIN_MS 5200
+#define VAD_COOLDOWN_MIN_MS 2200
+#endif
+/** Extra mute beyond padding for long replies: min(audio_ms/8, cap); avoids doubling clip duration in cooldown. */
+#ifndef VAD_LONG_PLAY_EXTRA_CAP_MS
+#define VAD_LONG_PLAY_EXTRA_CAP_MS 1600
 #endif
 
-/** Full-buffer playback only: entire HTTP body is accumulated, then ONE I2S pass (no chunk-by-chunk speech). */
+/** Full-buffer playback (mode 0): entire HTTP body, then ONE I2S pass.
+ * Stream mode (1): jitter ring — still one continuous utterance, not “packet speech”. */
 
 #ifndef PCM_NORMALIZE_PEAK_TARGET
 /** Loudest clean int16 peak before optional PLAYBACK_GAIN_PERCENT (32767 = absolute max). */
@@ -70,7 +94,7 @@ static const char* BACKEND_HOST = "backend.dev1974sai.workers.dev";
 
 /** Applied after peak-normalize (100 = unity). Use >100 only if you accept clipping (“overdrive”). */
 #ifndef PLAYBACK_GAIN_PERCENT
-#define PLAYBACK_GAIN_PERCENT 100
+#define PLAYBACK_GAIN_PERCENT 200
 #endif
 
 // Must match setupI2SSpeaker() — used to flush real silence through TX DMA (stops last-sample “stuck”).
@@ -135,7 +159,7 @@ void setupI2SSpeaker() {
   i2s_set_pin(I2S_NUM_1, &pins);
   i2s_zero_dma_buffer(I2S_NUM_1);
 
-  Serial.println("[I2S SPEAKER] ready (24 kHz, int16 in 32-bit slots)");
+  Serial.println("[I2S SPEAKER] ready (22.05 kHz, int16 in 32-bit slots)");
 }
 
 void connectWiFi() {
@@ -300,7 +324,6 @@ static bool pcmAccumReserve(size_t goal) {
   return true;
 }
 
-/** Append decoded PCM chunk to heap buffer; false if over limit or realloc fails. */
 static bool pcmAccumAppend(const uint8_t* src, size_t n) {
   if (n == 0)
     return true;
@@ -434,6 +457,59 @@ static void silenceSpeakerTail() {
                portMAX_DELAY);
   }
   i2s_zero_dma_buffer(I2S_NUM_1);
+}
+
+// ----- Stream mode (CHAT_PCM_PLAY_MODE 1): small prefill then play while downloading -----
+
+static uint8_t pcmJb[PCM_JITTER_BYTES];
+static size_t pcmJbLen = 0;
+
+static void pcmJbReset() {
+  pcmJbLen = 0;
+}
+
+static void pcmJbDrain(bool* checkedWav, bool flushAll) {
+  if (!flushAll && pcmJbLen < PCM_STREAM_PREFILL_BYTES)
+    return;
+
+  while (pcmJbLen >= PCM_STREAM_DRAIN_BLOCK_BYTES ||
+         (flushAll && pcmJbLen >= 2)) {
+    size_t take = (pcmJbLen >= PCM_STREAM_DRAIN_BLOCK_BYTES)
+                      ? PCM_STREAM_DRAIN_BLOCK_BYTES
+                      : (pcmJbLen & ~(size_t)1);
+    if (take < 2) break;
+    writePcmBytesToI2s(pcmJb, take, checkedWav);
+    memmove(pcmJb, pcmJb + take, pcmJbLen - take);
+    pcmJbLen -= take;
+  }
+}
+
+static void pcmJbPush(const uint8_t* data, size_t n, bool* checkedWav) {
+  while (n > 0) {
+    size_t space = sizeof(pcmJb) - pcmJbLen;
+    if (space == 0) {
+      pcmJbDrain(checkedWav, true);
+      space = sizeof(pcmJb) - pcmJbLen;
+      if (space == 0) break;
+    }
+    size_t cpy = n < space ? n : space;
+    memcpy(pcmJb + pcmJbLen, data, cpy);
+    pcmJbLen += cpy;
+    data += cpy;
+    n -= cpy;
+    pcmJbDrain(checkedWav, false);
+  }
+}
+
+static void pcmJbFlush(bool* checkedWav) {
+  pcmJbDrain(checkedWav, true);
+  if (pcmJbLen & 1)
+    pcmJbLen--;
+}
+
+static void finishStreamPlayback(bool* checkedWav) {
+  pcmJbFlush(checkedWav);
+  silenceSpeakerTail();
 }
 
 /** One contiguous playback pass + DMA silence tail; frees accumulator. */
@@ -633,19 +709,29 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   long contentLen = parseContentLengthHdr(headers);
   Serial.printf("[AI] chunked=%d content-length=%ld\n", chunked ? 1 : 0, contentLen);
 
-  pcmAccumClear();
-  if (!chunked && contentLen > 0 &&
-      (unsigned long)contentLen <= (unsigned long)CHAT_PCM_MAX_BYTES)
-    pcmAccumReserve((size_t)contentLen);
+  const bool streamPlay = (CHAT_PCM_PLAY_MODE != 0);
+
+  if (!streamPlay) {
+    pcmAccumClear();
+    if (!chunked && contentLen > 0 &&
+        (unsigned long)contentLen <= (unsigned long)CHAT_PCM_MAX_BYTES)
+      pcmAccumReserve((size_t)contentLen);
+  } else {
+    pcmJbReset();
+    i2s_zero_dma_buffer(I2S_NUM_1);
+    Serial.printf("[PCM] stream mode (prefill %u B)\n",
+                  (unsigned)PCM_STREAM_PREFILL_BYTES);
+  }
 
   uint8_t buf[1024];
   size_t totalRx = 0;
   bool accumFull = false;
+  bool checkedWav = false;
   unsigned long pcmDeadline = millis() + CHAT_HTTP_TIMEOUT_MS;
 
   if (chunked) {
     for (;;) {
-      if (accumFull)
+      if (!streamPlay && accumFull)
         break;
       char lineBuf[96];
       if (!readLineCrLf(client, lineBuf, sizeof(lineBuf), pcmDeadline)) {
@@ -675,12 +761,21 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         if (!readExact(client, buf, take, pcmDeadline)) {
           Serial.println("[PCM] short chunk read");
           client.stop();
+          if (streamPlay) {
+            finishStreamPlayback(&checkedWav);
+            size_t played = totalRx & ~(size_t)1;
+            Serial.printf("[AUDIO DONE] rx=%u played=%u (stream truncated)\n",
+                          (unsigned)totalRx, (unsigned)played);
+            return played;
+          }
           size_t played = playBufferedPcmAndSilence();
           Serial.printf("[AUDIO DONE] rx=%u played=%u (truncated)\n", (unsigned)totalRx,
                         (unsigned)played);
           return played;
         }
-        if (!pcmAccumAppend(buf, take)) {
+        if (streamPlay)
+          pcmJbPush(buf, take, &checkedWav);
+        else if (!pcmAccumAppend(buf, take)) {
           Serial.println("[PCM] buffer limit — draining chunk then stopping capture");
           accumFull = true;
           chunkSz -= take;
@@ -696,7 +791,7 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         chunkSz -= take;
       }
 
-      if (accumFull)
+      if (!streamPlay && accumFull)
         break;
 
       uint8_t crlf[2];
@@ -706,11 +801,13 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
       }
     }
   } else if (contentLen > 0) {
-    while (contentLen > 0 && !accumFull) {
+    while (contentLen > 0 && (!streamPlay ? !accumFull : true)) {
       size_t take = (size_t)contentLen > sizeof(buf) ? sizeof(buf) : (size_t)contentLen;
       if (!readExact(client, buf, take, pcmDeadline))
         break;
-      if (!pcmAccumAppend(buf, take)) {
+      if (streamPlay)
+        pcmJbPush(buf, take, &checkedWav);
+      else if (!pcmAccumAppend(buf, take)) {
         Serial.println("[PCM] buffer limit");
         accumFull = true;
         contentLen -= (long)take;
@@ -728,7 +825,7 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
     }
   } else {
     unsigned long lastData = millis();
-    while (millis() < pcmDeadline && !accumFull) {
+    while (millis() < pcmDeadline && (!streamPlay ? !accumFull : true)) {
       int avail = client.available();
       if (avail > 0) {
         lastData = millis();
@@ -736,7 +833,9 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
         if (want & 1) want--;
         int len = client.read(buf, want > 0 ? want : 0);
         if (len > 0) {
-          if (!pcmAccumAppend(buf, (size_t)len)) {
+          if (streamPlay)
+            pcmJbPush(buf, (size_t)len, &checkedWav);
+          else if (!pcmAccumAppend(buf, (size_t)len)) {
             Serial.println("[PCM] buffer limit");
             accumFull = true;
             break;
@@ -756,6 +855,13 @@ size_t sendChatAndSpeak(const String& transcript, const String& langHint) {
   }
 
   client.stop();
+  if (streamPlay) {
+    finishStreamPlayback(&checkedWav);
+    size_t played = totalRx & ~(size_t)1;
+    Serial.printf("[AUDIO DONE] rx=%u stream PCM bytes (no whole-buffer wait)\n",
+                  (unsigned)totalRx);
+    return played;
+  }
   size_t played = playBufferedPcmAndSilence();
   Serial.printf("[AUDIO DONE] rx=%u played=%u PCM bytes\n", (unsigned)totalRx, (unsigned)played);
   return played;
@@ -809,14 +915,20 @@ void loop() {
       pcmBytes &= ~(size_t)1;
       unsigned long audioMs =
           pcmBytes > 0 ? ((pcmBytes / 2) * 1000UL / (unsigned long)SAMPLE_RATE_OUT) : 0;
-      unsigned long guard = audioMs + (unsigned long)VAD_AFTER_PLAY_PADDING_MS;
+      /* Playback already ran for audioMs; do not add full audioMs again or mute doubles clip length. */
+      unsigned long extraLong =
+          audioMs / 8UL > (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
+              ? (unsigned long)VAD_LONG_PLAY_EXTRA_CAP_MS
+              : audioMs / 8UL;
+      unsigned long guard =
+          (unsigned long)VAD_AFTER_PLAY_PADDING_MS + extraLong;
       if (guard < (unsigned long)VAD_COOLDOWN_MIN_MS)
         guard = (unsigned long)VAD_COOLDOWN_MIN_MS;
       if (guard > 90000UL)
         guard = 90000UL;
       vadCooldownUntilMs = millis() + guard;
-      Serial.printf("[VAD] pause %lu ms (~%lu ms audio) — blocks echo re-trigger\n",
-                    guard, audioMs);
+      Serial.printf("[VAD] mute-after-play %lu ms (spoken ~%lu ms; tail blocks echo)\n", guard,
+                    audioMs);
     } else {
       vadCooldownUntilMs = millis() + (unsigned long)VAD_COOLDOWN_EMPTY_MS;
     }

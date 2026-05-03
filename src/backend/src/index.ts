@@ -16,7 +16,7 @@ import { z } from 'zod'
  *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT.
  *   POST /chat        Text -> agent (Vercel AI SDK + OpenAI + Firecrawl
  *                     web search tool) -> Sarvam Bulbul v3 TTS -> raw PCM
- *                     (24 kHz mono s16le, application/octet-stream, chunked).
+ *                     (22.05 kHz mono s16le, application/octet-stream, chunked).
  *                     Conversation history (last 6 turns) is kept in
  *                     Cloudflare KV per `deviceId`.
  *
@@ -42,13 +42,16 @@ const SARVAM_STT_URL = 'https://api.sarvam.ai/speech-to-text'
 const SARVAM_TTS_URL = 'https://api.sarvam.ai/text-to-speech'
 const SARVAM_STT_MODEL = 'saaras:v3'
 const SARVAM_TTS_MODEL = 'bulbul:v3'
-const SARVAM_TTS_DEFAULT_SPEAKER = 'shubh'
-const SARVAM_TTS_DEFAULT_LANG = 'en-IN'
-const SARVAM_TTS_SAMPLE_RATE = 24000
+/** Defaults aligned with Sarvam Bulbul v3 hi-IN “simran” studio preset (REST body, not Node SDK). */
+const SARVAM_TTS_DEFAULT_SPEAKER = 'simran'
+const SARVAM_TTS_DEFAULT_LANG = 'hi-IN'
+const SARVAM_TTS_SAMPLE_RATE = 48000
+const SARVAM_TTS_PACE = 1.5
+const SARVAM_TTS_ENABLE_PREPROCESSING = true
 const SARVAM_TTS_PCM_CHUNK_BYTES = 8192 // ReadableStream enqueue size (downstream chunked TE)
-const SARVAM_TTS_CHAR_LIMIT = 1800 // bulbul:v3 caps at 2500; keep headroom for safety
+const SARVAM_TTS_CHAR_LIMIT = 2500 // bulbul:v3 caps at 2500; keep headroom for safety
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB safety cap; Sarvam sync limit is 30 s of audio
-const MAX_HISTORY_MESSAGES = 12 // 6 user + 6 assistant turns
+const MAX_HISTORY_MESSAGES = 50 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
 const OPENHORIZON_MODEL = 'openhorizon/gemma4:latest'
 
@@ -82,7 +85,7 @@ app.get('/', (c) =>
       'GET /': 'this index',
       'GET /health': 'health probe',
       'POST /transcribe': 'transcribe audio -> text',
-      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> PCM s16le 24k mono',
+      'POST /chat': 'text -> agent (with web search) -> Sarvam TTS -> PCM s16le 22.05k mono',
     },
   })
 )
@@ -219,6 +222,8 @@ const ChatBodySchema = z.object({
   // mirrors the user's language regardless; this only steers the TTS voice.
   language_code: z.string().min(2).max(10).optional(),
   speaker: z.string().min(1).max(32).optional(),
+  pace: z.number().min(0.5).max(2).optional(),
+  enable_preprocessing: z.boolean().optional(),
   // Set true to wipe per-device history before this turn (e.g. wake word).
   reset: z.boolean().optional(),
 })
@@ -248,6 +253,9 @@ app.post('/chat', async (c) => {
   const { deviceId, text, reset } = parsed.data
   const languageCode = parsed.data.language_code ?? SARVAM_TTS_DEFAULT_LANG
   const speaker = parsed.data.speaker ?? SARVAM_TTS_DEFAULT_SPEAKER
+  const ttsPace = parsed.data.pace ?? SARVAM_TTS_PACE
+  const ttsPreprocess =
+    parsed.data.enable_preprocessing ?? SARVAM_TTS_ENABLE_PREPROCESSING
 
   const histKey = `hist:${deviceId}`
   const history = reset
@@ -350,7 +358,8 @@ app.post('/chat', async (c) => {
         model: SARVAM_TTS_MODEL,
         speaker,
         speech_sample_rate: SARVAM_TTS_SAMPLE_RATE,
-        pace: 1.0,
+        pace: ttsPace,
+        enable_preprocessing: ttsPreprocess,
         output_audio_codec: 'linear16',
       }),
     })
@@ -378,6 +387,7 @@ app.post('/chat', async (c) => {
     headers: {
       'content-type': 'application/octet-stream',
       'cache-control': 'no-cache',
+      'x-pcm-sample-rate': String(SARVAM_TTS_SAMPLE_RATE),
       'x-reply-text': encodeURIComponent(reply.slice(0, 256)),
       'x-history-len': String(newHist.length),
     },
