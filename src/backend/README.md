@@ -3,7 +3,7 @@
 Cloudflare Worker (Hono) that powers the Open EvE desk robot. It exposes:
 
 - `POST /transcribe` – proxy to [Sarvam Saaras v3 STT](https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/speech-to-text/rest-api); response is passed through (e.g. `transcript`, `language_code`).
-- `POST /chat` – Vercel AI SDK agent (OpenHorizon + Firecrawl `webSearch` tool). After `generateText`, TTS is **conditional**:
+- `POST /chat` – Vercel AI SDK agent (xAI Responses / Grok + Firecrawl `webSearch` tool). After `generateText`, TTS is **conditional**:
   - **Indian languages** (`hi`, `bn`, `ta`, `te`, `kn`, `ml`, `mr`, `gu`, `pa`, `ur`, `or`, `as` per primary subtag): [Sarvam Bulbul](https://docs.sarvam.ai/api-reference-docs/api-guides-tutorials/text-to-speech/rest-api) streaming **`linear16`** PCM @ 24 kHz.
   - **All other languages** (including English and `en-*`): [xAI Text to Speech](https://docs.x.ai/developers/model-capabilities/audio/text-to-speech), voice **`eve`**, raw **PCM** @ 24 kHz.
 
@@ -21,13 +21,12 @@ Secrets are read from `.dev.vars` for local dev. For production each one is stor
 ```sh
 bunx wrangler secret put SARVAM_API_KEY
 bunx wrangler secret put XAI_API_KEY
-bunx wrangler secret put OPENHORIZON_API_KEY
 bunx wrangler secret put FIRECRAWL_API_KEY
 bun run deploy
 ```
 
 - **`SARVAM_API_KEY`** – required for **`/transcribe`** and for **`/chat`** when `language_code` is an **Indian** language (Bulbul TTS).
-- **`XAI_API_KEY`** – required for **`/chat`** when the language is **English or any non-Indian** code (xAI `eve` TTS). Not used for STT.
+- **`XAI_API_KEY`** – required for **every** **`/chat`** request (xAI Grok via Responses API). Also used for xAI `eve` TTS when the language is **English or any non-Indian** code. Not used for STT.
 
 The KV namespace `SESSIONS` (used by `/chat` for conversation history) is created once with:
 
@@ -191,7 +190,7 @@ ESP32 mic --(VAD)--> POST /transcribe (pcm -> WAV) --> Sarvam STT --> transcript
 ESP32 (I2S speaker) <-- PCM 24 kHz <-- POST /chat (deviceId, text, language_code)
                                           |
                                           +-- KV: load history
-                                          +-- AI SDK generateText (OpenHorizon) + Firecrawl webSearch
+                                          +-- AI SDK generateText (xAI Responses / Grok) + Firecrawl webSearch
                                           +-- KV: save history (TTL 30 min)
                                           +-- TTS branch:
                                                 Indian -> Sarvam Bulbul streaming linear16

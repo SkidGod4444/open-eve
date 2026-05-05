@@ -9,7 +9,6 @@ declare namespace Cloudflare {
 		SESSIONS: KVNamespace;
 		SARVAM_API_KEY: string;
 		XAI_API_KEY: string;
-		OPENHORIZON_API_KEY: string;
 		FIRECRAWL_API_KEY: string;
 	}
 }
@@ -21,7 +20,7 @@ declare namespace NodeJS {
 	interface ProcessEnv extends StringifyValues<
 		Pick<
 			Cloudflare.Env,
-			'SARVAM_API_KEY' | 'XAI_API_KEY' | 'OPENHORIZON_API_KEY' | 'FIRECRAWL_API_KEY'
+			'SARVAM_API_KEY' | 'XAI_API_KEY' | 'FIRECRAWL_API_KEY'
 		>
 	> {}
 }

@@ -20,7 +20,6 @@
   ]
   // Secrets (set via `wrangler secret put <NAME>` in prod, or .dev.vars locally):
   //   SARVAM_API_KEY     - Sarvam Saaras v3 STT (/transcribe) + Bulbul TTS (Indian /chat)
-  //   XAI_API_KEY        - xAI TTS only (/chat when language is English or non-Indian)
-  //   OPENHORIZON_API_KEY     - OpenHorizon for the Vercel AI SDK agent
+  //   XAI_API_KEY        - xAI Grok Responses API (/chat agent) + xAI TTS (English/non-Indian /chat)
   //   FIRECRAWL_API_KEY  - Firecrawl web search tool
 }

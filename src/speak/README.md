@@ -7,8 +7,8 @@ Single-board ESP32 sketch that runs the full voice loop:
 3. Client-side merge: transcripts that arrive within 1500 ms of each other
    are concatenated into one user turn (hard cap: 6 fragments).
 4. POST the merged text to `/chat` -> the Worker runs the Vercel AI SDK
-   agent with a Firecrawl `webSearch` tool, then synthesises the spoken
-   reply with Sarvam Bulbul v3 TTS.
+   agent (xAI Grok Responses + Firecrawl `webSearch`), then synthesises the
+   spoken reply: Sarvam Bulbul v3 for Indian languages, xAI `eve` TTS for English and other non-Indian languages.
 5. The WAV body (24 kHz mono Linear16) is streamed as it arrives, upsampled
    on the fly to 44.1 kHz stereo, and pushed into a FreeRTOS StreamBuffer.
 6. The pschatzmann ESP32-A2DP source library SBC-encodes the StreamBuffer
@@ -103,9 +103,8 @@ Open [`speech-to-text.ino`](./speech-to-text.ino) and edit the top constants:
 | `MAX_UTTERANCE_SECONDS` | 2 (default) – raise to 3-4 only with PSRAM.               |
 | `MIC_SHIFT`         | 11 (default). Lower = louder. See header comments.           |
 
-The backend (`src/backend/`) must be deployed and reachable, and its three
-secrets (`SARVAM_API_KEY`, `OPENHORIZON_API_KEY`, `FIRECRAWL_API_KEY`) must be
-set. See [`../backend/README.md`](../backend/README.md).
+The backend (`src/backend/`) must be deployed and reachable, and its secrets
+(`SARVAM_API_KEY`, `XAI_API_KEY`, `FIRECRAWL_API_KEY`) must be set. See [`../backend/README.md`](../backend/README.md).
 
 ## Build & flash
 

@@ -4,7 +4,7 @@ import { logger } from 'hono/logger'
 import { HTTPException } from 'hono/http-exception'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { generateText, stepCountIs, tool } from 'ai'
-import { createOpenAI } from '@ai-sdk/openai'
+import { createXai } from '@ai-sdk/xai'
 import { APICallError } from '@ai-sdk/provider'
 import Firecrawl from '@mendable/firecrawl-js'
 import { z } from 'zod'
@@ -14,7 +14,7 @@ import { z } from 'zod'
  *
  * Endpoints:
  *   POST /transcribe  Audio -> text via Sarvam Saaras v3 STT (passthrough JSON: transcript + language_code).
- *   POST /chat        Text -> agent -> TTS (conditional):
+ *   POST /chat        Text -> xAI Responses agent -> TTS (conditional):
  *                       Indian langs -> Sarvam Bulbul streaming `linear16` PCM.
  *                       English / international -> xAI `/v1/tts` PCM @ 24 kHz, voice `eve`.
  *                     KV history per `deviceId`.
@@ -57,7 +57,9 @@ const CHAT_REPLY_HEADER_MAX_ENCODED_BYTES = 6144
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024 // 25 MB cap; Sarvam sync STT ~30 s practical limit
 const MAX_HISTORY_MESSAGES = 50 // 6 user + 6 assistant turns
 const HISTORY_TTL_SECONDS = 60 * 30 // 30 min idle session window
-const OPENHORIZON_MODEL = 'openhorizon/gemma4:latest'
+/** xAI Responses API (`/v1/responses`); must stay in sync with worker capabilities. */
+const XAI_LLM_MODEL = 'grok-4.20-0309-non-reasoning' as const
+const XAI_LLM_MAX_OUTPUT_TOKENS = 2_000_000
 
 /** Primary ISO 639-1 tags treated as Indian languages → Sarvam TTS. */
 const INDIAN_PRIMARY_LANG_TAGS = new Set([
@@ -106,7 +108,7 @@ app.get('/', (c) =>
       stt: 'sarvam.ai/speech-to-text (Saaras v3)',
       tts_intl: 'x.ai/v1/tts → PCM eve @ 24 kHz',
       tts_in: 'sarvam.ai/text-to-speech/stream (Bulbul v3 → PCM)',
-      llm: `${OPENHORIZON_MODEL} via Vercel AI SDK`,
+      llm: `${XAI_LLM_MODEL} via xAI Responses (Vercel AI SDK)`,
       websearch: 'firecrawl.dev /search',
     },
     endpoints: {
@@ -258,15 +260,14 @@ const ChatBodySchema = z.object({
 
 app.post('/chat', async (c) => {
   const xaiKey = bindingSecret(c.env.XAI_API_KEY)
-  const openHorizonApiKey = bindingSecret(c.env.OPENHORIZON_API_KEY)
-  if (!openHorizonApiKey) {
-    throw new HTTPException(500, { message: 'OPENHORIZON_API_KEY is not configured' })
-  }
   if (!c.env.FIRECRAWL_API_KEY) {
     throw new HTTPException(500, { message: 'FIRECRAWL_API_KEY is not configured' })
   }
   if (!c.env.SESSIONS) {
     throw new HTTPException(500, { message: 'SESSIONS KV binding is missing' })
+  }
+  if (!xaiKey) {
+    throw new HTTPException(500, { message: 'XAI_API_KEY is not configured (required for /chat agent + non-Indian TTS)' })
   }
 
   const raw = await c.req.json().catch(() => null)
@@ -283,8 +284,6 @@ app.post('/chat', async (c) => {
     if (!bindingSecret(c.env.SARVAM_API_KEY)) {
       throw new HTTPException(500, { message: 'SARVAM_API_KEY is not configured (required for Indian-language TTS)' })
     }
-  } else if (!xaiKey) {
-    throw new HTTPException(500, { message: 'XAI_API_KEY is not configured (required for non-Indian TTS)' })
   }
 
   const languageCode = langRaw.length >= 2 ? langRaw : DEFAULT_CHAT_LANGUAGE_CODE
@@ -302,10 +301,7 @@ app.post('/chat', async (c) => {
     ? []
     : ((await c.env.SESSIONS.get<ChatTurn[]>(histKey, 'json')) ?? [])
 
-  const openai = createOpenAI({
-    baseURL: 'https://api.openhorizon.devwtf.in/v1',
-    apiKey: openHorizonApiKey,
-  })
+  const xaiProvider = createXai({ apiKey: xaiKey })
   const firecrawl = new Firecrawl({ apiKey: c.env.FIRECRAWL_API_KEY })
 
   const webSearch = tool({
@@ -343,7 +339,7 @@ app.post('/chat', async (c) => {
   })
 
   const systemPrompt =
-    "You are EvE, a friendly desk robot by Saidev Dhal built using OpenHorizon AI provider. Reply in 1 to 3 short sentences " +
+    "You are EvE, a friendly desk robot by Saidev Dhal powered by xAI Grok. Reply in 1 to 3 short sentences " +
     "suitable for spoken audio. Never use markdown, bullet lists, code fences, " +
     "URLs, or emojis - the reply will be read out loud by a TTS engine. " +
     "If a fact is time sensitive (today, latest, current, live, now) call the " +
@@ -354,9 +350,8 @@ app.post('/chat', async (c) => {
   let reply: string
   try {
     const result = await generateText({
-      // Use Chat Completions (`/v1/chat/completions`). The callable `openai(...)`
-      // defaults to the Responses API (`/v1/responses`), which OpenHorizon does not expose.
-      model: openai.chat(OPENHORIZON_MODEL),
+      model: xaiProvider.responses(XAI_LLM_MODEL),
+      maxOutputTokens: XAI_LLM_MAX_OUTPUT_TOKENS,
       system: systemPrompt,
       messages: [...history, { role: 'user', content: text }],
       tools: { webSearch },
@@ -551,8 +546,8 @@ function formatAgentError(err: unknown): string {
       err.statusCode === 401 || /\bunauthorized\b/i.test(bits.join(' '))
     if (unauthorized) {
       bits.push(
-        'OpenHorizon expects Authorization: Bearer <key> (the AI SDK does this automatically). ' +
-          'Update the key with wrangler secret put OPENHORIZON_API_KEY (prod) or add OPENHORIZON_API_KEY=… to .dev.vars for wrangler dev — Wrangler does not read .env.'
+        'xAI expects Authorization: Bearer <key> (the AI SDK sets this automatically). ' +
+          'Update the key with wrangler secret put XAI_API_KEY (prod) or add XAI_API_KEY=… to .dev.vars for wrangler dev — Wrangler does not read .env.'
       )
     }
     return bits.join(' ')
