@@ -1,208 +1,159 @@
-# Open EvE - voice agent firmware (`speech-to-text.ino`)
+# Open EvE — `speak.ino`
 
-Single-board ESP32 sketch that runs the full voice loop:
+Voice loop on ESP32-S3: I2S mic → Worker STT → Worker chat/TTS → I2S speaker. Wi‑Fi + optional captive portal.
 
-1. INMP441 I2S mic + adaptive energy VAD.
-2. POST raw PCM to the Cloudflare Worker `/transcribe` endpoint -> Sarvam STT.
-3. Client-side merge: transcripts that arrive within 1500 ms of each other
-   are concatenated into one user turn (hard cap: 6 fragments).
-4. POST the merged text to `/chat` -> the Worker runs the Vercel AI SDK
-   agent (xAI Grok Responses + Firecrawl `webSearch`), then synthesises the
-   spoken reply: Sarvam Bulbul v3 for Indian languages, xAI `eve` TTS for English and other non-Indian languages.
-5. The WAV body (24 kHz mono Linear16) is streamed as it arrives, upsampled
-   on the fly to 44.1 kHz stereo, and pushed into a FreeRTOS StreamBuffer.
-6. The pschatzmann ESP32-A2DP source library SBC-encodes the StreamBuffer
-   into a Bluetooth speaker.
+---
 
-Everything runs concurrently across both ESP32 cores; the I2S mic keeps
-listening even while a reply is playing.
+## Hardware wiring (everything the sketch actually uses)
 
-## Hardware
+The firmware only assigns GPIO for **two I2S buses**, an **optional wake button**, and **USB UART** for logs. There are **no other wired peripherals** in code (no LEDs, no SPI display, no Bluetooth audio).
 
-| Part                          | Notes                                                  |
-| ----------------------------- | ------------------------------------------------------ |
-| ESP32 dev board (classic)     | **must** be classic ESP32 (WROOM/WROVER). ESP32-S3 has no A2DP. |
-| ESP32-WROVER (PSRAM)          | strongly recommended; lets you raise `MAX_UTTERANCE_SECONDS`. |
-| INMP441 I2S mic               | wired WS=GPIO25, SD=GPIO33, SCK=GPIO26.                |
-| Bluetooth speaker             | any A2DP sink. Tune `BT_SPEAKER_SUBSTRING` to a unique part of the advertised name (Serial shows `[BT scan]` lines).|
-| 5 V USB power supply          | the BT stack + Wi-Fi + I2S together can pull >300 mA. |
+Pin defines and `i2s_set_pin` usage:
 
-## Toolchain
+```102:110:src/speak/speak.ino
+// ===== MIC (I2S0) =====
+#define I2S_WS    15
+#define I2S_SCK   16
+#define I2S_SD    4
 
-This is an Arduino sketch. Build with either:
-
-### Option A: PlatformIO (recommended)
-
-A [`platformio.ini`](../../platformio.ini) at the repo root already wires
-this sketch to the `esp32-voice` environment:
-
-- `board = esp32dev` (classic ESP32 — required for A2DP).
-- `board_build.partitions = huge_app.csv` (Bluetooth Classic + Wi-Fi + TLS
-  doesn't fit the default 1.2 MB app slot).
-- `lib_deps = pschatzmann/ESP32-A2DP@^1.8.10`.
-- `build_src_filter` keeps only `src/speak/` so the eyes sketch and the
-  Cloudflare Worker source aren't compiled into the firmware.
-
-```sh
-pio run -e esp32-voice                # build
-pio run -e esp32-voice -t upload      # flash
-pio device monitor -e esp32-voice -b 115200   # serial monitor
+// ===== SPEAKER (I2S1) =====
+#define I2S_OUT_WS   17
+#define I2S_OUT_SCK  18
+#define I2S_OUT_SD   21
 ```
 
-A vendored copy of the ESP32-A2DP library also lives at
-[`lib/ESP32-A2DP/`](../../lib/ESP32-A2DP/) for offline builds (PlatformIO's
-default `lib_dir` is `lib/`, so it's auto-discovered).
+I2S roles from `setupI2SMic()` / `setupI2SSpeaker()`: ESP32 is **I2S master** on both ports — it drives **WS** and **SCK** for the mic and for the speaker; it **reads** mic data on `I2S_SD` and **writes** speaker data on `I2S_OUT_SD`.
 
-### Option B: Arduino IDE
+### 1. I2S microphone → ESP32-S3
 
-Install via the Library Manager:
+Wire the mic breakout to the DevKit like this:
 
-| Library                                                      | Why                  |
-| ------------------------------------------------------------ | -------------------- |
-| [pschatzmann/ESP32-A2DP](https://github.com/pschatzmann/ESP32-A2DP) | `BluetoothA2DPSource`|
+| Mic breakout pin (typical names) | Connect to ESP32-S3 | `speak.ino` define |
+| --------------------------------- | ------------------- | ------------------ |
+| **WS** / LRCL / LRCK | **GPIO 15** | `I2S_WS` |
+| **SCK** / BCLK | **GPIO 16** | `I2S_SCK` |
+| **SD** / DOUT (data from mic) | **GPIO 4** | `I2S_SD` |
+| **VDD** / 3V3 | **3.3 V** on the board | — |
+| **GND** | **GND** | — |
 
-Everything else (`WiFi`, `WiFiClientSecure`, `HTTPClient`, FreeRTOS, the
-legacy `driver/i2s.h`) ships with the ESP32 Arduino core (>=3.0 recommended).
+Notes from the firmware (affects module straps, not more GPIO):
 
-Board settings:
+- Mic path is **I2S RX**, **16 kHz**, **left channel only** (`I2S_CHANNEL_FMT_ONLY_LEFT` in `setupI2SMic()`).
+- On parts like the **INMP441**, set **L/R** to match **left** for that channel choice (often **GND** or **3V3** per datasheet).
 
-- *Tools -> Board*: any classic ESP32 (e.g. *ESP32 Dev Module*). **Not** an S3.
-- *Tools -> Partition Scheme*: *Huge APP (3 MB No OTA / 1 MB SPIFFS)* —
-  required for the Bluetooth Classic stack to fit.
-- *Tools -> PSRAM*: Enabled (only if you have a WROVER). The sketch's
-  allocator (`tryAllocBytes`) tries PSRAM first then falls back.
+### 2. I2S speaker / DAC+amp → ESP32-S3
 
-### IntelliSense (VS Code)
+Wire the amplifier (e.g. MAX98357-style) to the **same** ESP32:
 
-If the C/C++ extension reports `cannot open source file
-"BluetoothA2DPSource.h"`, it just means it can't find the cloned library on
-disk. The repo ships
-[`.vscode/c_cpp_properties.json`](../../.vscode/c_cpp_properties.json)
-already pointing at both `lib/ESP32-A2DP/src` and
-`.pio/libdeps/esp32-voice/ESP32-A2DP/src`, so either of these resolves it:
+| Amp breakout pin (typical names) | Connect to ESP32-S3 | `speak.ino` define |
+| --------------------------------- | ------------------- | ------------------ |
+| **LRC** / WS (word select) | **GPIO 17** | `I2S_OUT_WS` |
+| **BCLK** | **GPIO 18** | `I2S_OUT_SCK` |
+| **DIN** (data **into** amp) | **GPIO 21** | `I2S_OUT_SD` |
+| **VIN** / **VDD** | **3.3 V** or **5 V** per module datasheet | — |
+| **GND** | **GND** | — |
 
-```sh
-# Vendored copy already exists - just reload the C/C++ extension.
-ls lib/ESP32-A2DP/src/BluetoothA2DPSource.h
+Firmware side: **I2S TX**, **24 kHz**, **left channel only** (`setupI2SSpeaker()` — matches Worker TTS rate in comments).
 
-# Or let PlatformIO install into .pio/libdeps/...
-pio pkg install -e esp32-voice
+If your module has **SD** / **GAIN** pins, follow the breakout’s datasheet (not referenced in `speak.ino`).
+
+### 3. Optional hardware wake button (compile-time only)
+
+Default in code:
+
+```94:96:src/speak/speak.ino
+#ifndef OPEN_EVE_HARDWARE_WAKE_GPIO
+#define OPEN_EVE_HARDWARE_WAKE_GPIO -1
+#endif
 ```
 
-Then run *C/C++: Reset IntelliSense Database* in VS Code.
+`-1` means **no wake GPIO** — this block is compiled out.
 
-## Configure
+If you change the sketch (or build flag) so `OPEN_EVE_HARDWARE_WAKE_GPIO` is **≥ 0**, that number becomes a real GPIO:
 
-Open [`speech-to-text.ino`](./speech-to-text.ino) and edit the top constants:
-
-| Constant            | What                                                         |
-| ------------------- | ------------------------------------------------------------ |
-| `WIFI_SSID` / `WIFI_PASS` | Your 2.4 GHz Wi-Fi (the ESP32 cannot use 5 GHz).         |
-| `BACKEND_HOST`      | Your Cloudflare Worker URL (`https://...workers.dev`).        |
-| `BT_SPEAKER_SUBSTRING`   | Case-sensitive substring inside the speaker’s Bluetooth name (e.g. `Stone 350 Pro` for boAt Stone Stone 350 Pro). Serial logs every candidate. |
-| `MAX_UTTERANCE_SECONDS` | 2 (default) – raise to 3-4 only with PSRAM.               |
-| `MIC_SHIFT`         | 11 (default). Lower = louder. See header comments.           |
-
-The backend (`src/backend/`) must be deployed and reachable, and its secrets
-(`SARVAM_API_KEY`, `XAI_API_KEY`, `FIRECRAWL_API_KEY`) must be set. See [`../backend/README.md`](../backend/README.md).
-
-## Build & flash
-
-```sh
-# PlatformIO (from repo root):
-pio run -e esp32-voice -t upload && pio device monitor -e esp32-voice -b 115200
-
-# Arduino IDE: open speech-to-text.ino, select your classic ESP32 board, the
-# Huge APP partition scheme, the right serial port, then click Upload.
+```1405:1408:src/speak/speak.ino
+#if OPEN_EVE_HARDWARE_WAKE_GPIO >= 0
+  pinMode(OPEN_EVE_HARDWARE_WAKE_GPIO, INPUT_PULLUP);
+  Serial.printf("[CONFIG] Hardware wake GPIO %d (active LOW) — idle audio stays offline\n",
+                OPEN_EVE_HARDWARE_WAKE_GPIO);
 ```
 
-## Verification (hardware-in-the-loop)
+Wiring:
 
-These are the runtime checks the firmware was designed to pass. Run through
-them after the first flash; tune buffers if anything trips.
+| Part | Connection |
+| ---- | ---------- |
+| Momentary switch | One leg → **GPIO `OPEN_EVE_HARDWARE_WAKE_GPIO`**, other leg → **GND** |
+| (internal) | `INPUT_PULLUP` — **unpressed** = high, **pressed** = low |
 
-1. **Boot log**
+Pick any free GPIO you assign in code; there is no default pin while it stays `-1`.
 
-   ```
-   Heap at boot: free=…, largest=…, psram_free=…
-   utterance pool: 2 x 65536 bytes (2 s each). free=…
-   WiFi connected, IP: 192.168.…
-   Mic ready
-   A2DP source started, scanning for 'Stone Stone 350 Pro'...
-   Voice agent ready. frame=20ms preroll=300ms hangover=700ms ...
-   ```
+### 4. Power + serial (host)
 
-   The free heap after boot should be > 60 KB. If it's lower, drop
-   `MAX_UTTERANCE_SECONDS` to 1 or move to a WROVER.
+| Purpose | Hardware |
+| ------- | -------- |
+| Run + flash + `Serial` logs | **USB** to the DevKit (`Serial.begin(115200)` in `setup()`) |
+| Supply | DevKit **3V3** / **5V** / **GND** headers to mic and amp per their ratings |
 
-2. **Bluetooth pairing**
+---
 
-   Power on the speaker. Within ~10 s the speaker should beep / connect.
-   Once paired, A2DP auto-reconnects on subsequent boots
-   (`set_auto_reconnect(true)`).
+## Wiring diagram (ASCII)
 
-3. **STT round-trip**
+```
+  I2S microphone                         ESP32-S3 DevKit              I2S speaker amp
+  (e.g. INMP441)                         (your board)                 (e.g. MAX98357A)
 
-   Speak normally for ~1 s. Expect:
+        VDD ───────────────────────────── 3V3
+        GND ───────────────────────────── GND
+        WS  ───────────────────────────── GPIO15  (I2S_WS)
+        SCK ───────────────────────────── GPIO16  (I2S_SCK)
+        SD  ───────────────────────────── GPIO4   (I2S_SD)
 
-   ```
-   [trigger] rms=… peak=… noise=… snr=… slot=0
-   [utt] end of speech. voiced=…ms total=…ms -> queue slot 0
-   [net] POST /transcribe …
-   [net] transcript (… ms): hello there
-   ```
 
-   STT should round-trip in ~700-1500 ms.
+                                        GPIO17  (I2S_OUT_WS) ───────── LRC / WS
+                                        GPIO18  (I2S_OUT_SCK) ──────── BCLK
+                                        GPIO21  (I2S_OUT_SD) ────────── DIN
+                                        3V3 or 5V (per module) ─────── VIN/VDD
+                                        GND ────────────────────────── GND
 
-4. **Merge window**
 
-   Say "what is the weather", pause briefly, then "in Delhi". Both
-   transcripts should be glued before flushing:
+  [Optional — only if OPEN_EVE_HARDWARE_WAKE_GPIO is set to a valid GPIO in code]
+                                        GPIO <N> ◄──────┐
+                                        GND ◄──────────┘  (momentary switch; pull-up in firmware)
+```
 
-   ```
-   [merge] +fragment (1 total): what is the weather
-   [merge] +fragment (2 total): what is the weather in Delhi
-   [merge] 1500 ms idle -> flush: what is the weather in Delhi
-   ```
+---
 
-5. **Agent + TTS playback**
+## ESP32-S3-DevKitC-1 header positions (v1.1)
 
-   ```
-   [chat] POST /chat (NN text bytes)
-   [chat] reply preview (urlenc): The%20weather%20in%20Delhi…
-   [chat] done: 240000 PCM bytes (cl=480044, remain=0), total 4500 ms, first audio +1500 ms
-   ```
+If your board is [ESP32-S3-DevKitC-1](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#header-block), **No.** on **J1** / **J3** matches Espressif’s table:
 
-   Audio should start coming out of the speaker within ~1.5 s of the POST
-   and play to completion without dropouts. If you hear scratches, raise
-   `AUDIO_RING_BYTES` in the sketch (e.g. 32 KB) - this absorbs longer
-   Wi-Fi/BT coexistence gaps.
+| GPIO | Header |
+| ---- | ------ |
+| 4 | J1 — 4 |
+| 15 | J1 — 8 |
+| 16 | J1 — 9 |
+| 17 | J1 — 10 |
+| 18 | J1 — 11 |
+| 21 | J3 — 18 |
 
-6. **Memory under load**
+---
 
-   While the reply is playing, start speaking again. The mic should still
-   trigger and capture (vad_task is on a different core from BT). Watch
-   the periodic `[idle] heap=…` log - free heap during playback should
-   stay above ~50 KB.
+## Not wired in `speak.ino`
 
-## Tuning cheat sheet
+- **Wi‑Fi / HTTPS** — on-chip, no extra pins.
+- **Bluetooth audio** — not used.
+- **Any GPIO not listed above** — unused unless you add code or set `OPEN_EVE_HARDWARE_WAKE_GPIO`.
 
-| Symptom                                  | Likely fix                                                              |
-| ---------------------------------------- | ----------------------------------------------------------------------- |
-| Random "buffer full" finalisations       | Raise `MAX_UTTERANCE_SECONDS` (PSRAM) or speak in shorter bursts.       |
-| Robot triggers on background hum         | Raise `ABSOLUTE_MIN_PEAK` (e.g. 2000) and/or `TRIGGER_SNR` (e.g. 3.5).   |
-| Robot misses your voice across the room  | Lower `ABSOLUTE_MIN_PEAK` (e.g. 800) and `MIC_SHIFT` (e.g. 9).          |
-| Audio scratchy / drops out               | Raise `AUDIO_RING_BYTES` to 32-64 KB. Confirm `WiFi.setSleep(false)`.   |
-| Reply takes forever to start             | Use a closer Bluetooth speaker; check the Worker logs for slow agent.   |
-| Reply ends a few words early             | Increase `stream_deadline` in `postChatAndStream` (currently 30 s).     |
+---
 
-## Project layout
+## Configure, build, layout
+
+- Edit Wi‑Fi, `BACKEND_HOST`, wake rules, and buffers at the top of [`speak.ino`](./speak.ino).
+- PlatformIO (repo root): `pio run -e esp32-s3-speak -t upload` then `pio device monitor -e esp32-s3-speak -b 115200`.
 
 ```
 open-eve/
-├── platformio.ini          # esp32-voice (this sketch) + esp32-eyes envs
-├── lib/ESP32-A2DP/         # vendored A2DP library (gitignored, reproducible from lib_deps)
 └── src/speak/
-    ├── speech-to-text.ino  # full firmware (mic + STT + merge + chat + A2DP)
-    └── README.md           # this file
+    ├── speak.ino
+    └── README.md
 ```
